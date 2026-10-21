@@ -17,7 +17,7 @@
 | W0 | GPU 环境搭建 + 自检脚本（版本/GPU/推理/ONNX 导出） | 完成 → [docs/environment.md](docs/environment.md) |
 | W1a | MVTec 下载校验 + YOLO-seg 转换管线 + 单测 + CI | 完成 → [docs/dataset.md](docs/dataset.md) |
 | W1b | 15 类全量数据 + 基线训练（mAP50-95、单类 AP、混淆矩阵） | 进行中 → [docs/baseline.md](docs/baseline.md) |
-| W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 代码与测试完成 → [docs/augmentation.md](docs/augmentation.md)；消融训练待填数 |
+| W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 代码与测试完成 → [docs/augmentation.md](docs/augmentation.md)；消融 B0 已出数（mask mAP50-95 0.2453），B1/B2/B4/C1 跑中 → [docs/baseline.md](docs/baseline.md) §3 |
 | W3 | ONNX 导出 + trtexec FP32/FP16/INT8（熵校准，500 张校准集） | 未开始（工具链待装） |
 | W4 | TensorRT C++ 推理服务：零拷贝 + 三线程流水线 + CMake + 压测报告 | 未开始（工具链待装） |
 
@@ -37,9 +37,10 @@ tools/
   convert_mvtec_to_yolo.py   MVTec AD → YOLOv8-seg 数据集
   synthesize_defects.py  Copy-Paste 缺陷合成，给已有数据集补齐少数类实例配额
   train_seg.py           训练入口：统一 CLI + 可选 focal 注入 + 配置留档 + 指标摘要
-  summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，并校验「单变量协议」有没有跑歪
+  summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，校验「单变量协议」与数据集转换环境指纹
+  run_ablation_queue.ps1 消融队列（幂等）：跑完的组自动跳过，被系统重启打断后重跑同一条命令即可续
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
-tests/               193 条 pytest，纯 CPU、不联网、不需要真实数据集
+tests/               215 条 pytest，纯 CPU、不联网、不需要真实数据集
 docs/                environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
 requirements-gpu.txt 本地 GPU 环境（钉版本）
@@ -73,15 +74,19 @@ python tools/train_seg.py --data out/yolo_mvtec_cp/data.yaml `
      --focal-gamma 2.0 --focal-alpha 0.25 --epochs 100
 # 合成只加 train，val/test 逐字节不动；细节和防泄漏口径见 docs/augmentation.md
 
-# 4) 消融跑完汇总成表，顺带校验各组超参真的一致
-python tools/summarize_ablation.py --markdown          # 可直接贴进 docs/baseline.md
-python tools/summarize_ablation.py --strict            # 协议不一致就返回非零
+# 4) 消融：四组各 100 epoch 要一小时以上，用幂等队列放后台跑
+#    跑完的组自动跳过，被系统重启打断后重跑同一条命令就从断点续
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/run_ablation_queue.ps1
 
-# 5) 单测（193 条，装 torch 约 18 秒；没装 torch 会自动跳 2 条真模型用例）
+# 5) 汇总成表，顺带校验各组超参与数据集转换环境真的一致
+python tools/summarize_ablation.py --markdown          # 可直接贴进 docs/baseline.md
+python tools/summarize_ablation.py --strict            # 协议或环境指纹不一致就返回非零
+
+# 6) 单测（215 条，装 torch 约 17 秒；没装 torch 会自动跳 2 条真模型用例）
 python -m pytest -q
 ```
 
-不装 GPU 环境也能跑通 2、3b 和 4：转换与合成管线只依赖 numpy / opencv / pyyaml。
+不装 GPU 环境也能跑通 2、3b 和 5：转换、合成与汇总只依赖 numpy / opencv / pyyaml（第 4 步的训练队列要 GPU）。
 CI 就是这么验的（ubuntu + windows × py3.10/3.12），并且在 CI 里端到端跑了一遍
 缺陷合成，逐字节断言 val/test 没被改动。
 
@@ -132,7 +137,10 @@ W2 合成管线实测（bottle + toothbrush，seed=0 / cap-factor=2 / workers=4�
 | 实例均衡 | bottle 50 → 101，toothbrush 47 → 105 |
 | 标签面积保真度 | mean 0.9675，p10 0.9215，min 0.8154 |
 | 划分变化 | train 335 → 375，val 29 / test 30 **零改动**（CI 逐字节断言） |
-| 测试规模 | 36 → **193** 条 pytest（W2 新增 157 条） |
+| 测试规模 | 36 → **215** 条 pytest（W2 新增 179 条） |
+| B0 基线（2 类子集） | mask mAP50-95 **0.2453** @ ep75，95/100 早停，15.7 min，峰值显存 2.3~3.0 GiB |
+| 环境漂移实测 | cv2 4.10 与 5.0 转出的 788 个标签里 **12 个差约 1 px**，含 val/test 各 1 个 |
+| 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 
 完整参数表、拒绝采样统计与两个 focal 踩坑记录见
 [docs/augmentation.md](docs/augmentation.md)。

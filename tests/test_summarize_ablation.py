@@ -328,3 +328,182 @@ def test_main_names_filter(two_runs, capsys):
 def test_main_rejects_unknown_metric(two_runs):
     with pytest.raises(SystemExit):
         sa.main(["--runs-root", str(two_runs), "--metric", "metrics/nope"])
+# ------------------------------------------------- 转换环境指纹交叉核对（W2 踩坑）
+
+FP_A = {"python": "3.12.3", "numpy": "1.26.4", "cv2": "4.10.0", "platform": "Windows-11"}
+FP_B = {"python": "3.12.5", "numpy": "2.5.2", "cv2": "5.0.0", "platform": "Windows-11"}
+
+
+def make_dataset(tmp_path: Path, name: str, env=None, *, broken=False, no_file=False) -> Path:
+    """造一个只有 data.yaml + dataset_stats.json 的假数据集目录。"""
+    d = tmp_path / "out" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "data.yaml").write_text("path: .\ntrain: images/train\n", encoding="utf-8")
+    if not no_file:
+        body = "{not json" if broken else json.dumps({"env": env} if env is not None else {})
+        (d / "dataset_stats.json").write_text(body, encoding="utf-8")
+    return d
+
+
+def make_synth_dataset(tmp_path: Path, name: str, env=None, *, broken=False) -> Path:
+    """Copy-Paste 合成出来的数据集：没有 dataset_stats.json，指纹在 synth_report.json。"""
+    d = tmp_path / "out" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "data.yaml").write_text("path: .\ntrain: images/train\n", encoding="utf-8")
+    body = "{not json" if broken else json.dumps({"env": env} if env is not None else {})
+    (d / "synth_report.json").write_text(body, encoding="utf-8")
+    return d
+
+
+def make_run_for(tmp_path: Path, runs_root: Path, run_name: str, ds_dir: Path, **cfg_over):
+    cfg = dict(BASE_CFG, data=str(ds_dir / "data.yaml"), **cfg_over)
+    return write_run(runs_root, run_name, [_row(1, 0.10, 0.10), _row(2, 0.12, 0.18)], cfg=cfg)
+
+
+def test_dataset_env_reads_fingerprint(tmp_path):
+    d = make_dataset(tmp_path, "ds", FP_A)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) == FP_A
+
+
+def test_dataset_env_accepts_dir_path(tmp_path):
+    d = make_dataset(tmp_path, "ds", FP_A)
+    assert sa.dataset_env({"data": str(d)}) == FP_A
+
+
+def test_dataset_env_none_when_no_data_key(tmp_path):
+    assert sa.dataset_env({}) is None
+    assert sa.dataset_env({"data": ""}) is None
+
+
+def test_dataset_env_none_when_stats_missing(tmp_path):
+    d = make_dataset(tmp_path, "ds", FP_A, no_file=True)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) is None
+
+
+def test_dataset_env_none_when_json_broken(tmp_path):
+    d = make_dataset(tmp_path, "ds", FP_A, broken=True)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) is None
+
+
+def test_dataset_env_none_when_field_absent_or_wrong_type(tmp_path):
+    d1 = make_dataset(tmp_path, "ds1", None)
+    assert sa.dataset_env({"data": str(d1 / "data.yaml")}) is None
+    d2 = make_dataset(tmp_path, "ds2")
+    (d2 / "dataset_stats.json").write_text(json.dumps({"env": "4.10"}), encoding="utf-8")
+    assert sa.dataset_env({"data": str(d2 / "data.yaml")}) is None
+
+
+def test_check_env_all_same_no_warning(tmp_path):
+    runs = tmp_path / "segment"
+    d = make_dataset(tmp_path, "ds", FP_A)
+    for n in ("a", "b"):
+        make_run_for(tmp_path, runs, n, d)
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert warns == [] and notes == []
+
+
+def test_check_env_flags_cross_env_drift(tmp_path):
+    """这就是 W2 真踩到的坑：base 环境 cv2 4.10 与 GPU 环境 cv2 5.0 转出的标签差约 1px。"""
+    runs = tmp_path / "segment"
+    da = make_dataset(tmp_path, "ds_base", FP_A)
+    db = make_dataset(tmp_path, "ds_gpu", FP_B)
+    make_run_for(tmp_path, runs, "b0_base", da)
+    make_run_for(tmp_path, runs, "b4_nogood", db)
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert any("转换环境不一致" in w for w in warns)
+    assert any("4.10.0" in w for w in warns) and any("5.0.0" in w for w in warns)
+    assert any("b0_base" in w and "b4_nogood" in w for w in warns)
+    assert notes == []
+
+
+def test_check_env_unknown_is_note_not_warning(tmp_path):
+    runs = tmp_path / "segment"
+    d = make_dataset(tmp_path, "ds_old", None)
+    make_run_for(tmp_path, runs, "legacy", d)
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert warns == []
+    assert any("legacy" in n for n in notes)
+
+
+def test_check_env_mixed_known_and_unknown(tmp_path):
+    runs = tmp_path / "segment"
+    d1 = make_dataset(tmp_path, "ds_new", FP_A)
+    d2 = make_dataset(tmp_path, "ds_old", None)
+    make_run_for(tmp_path, runs, "new_run", d1)
+    make_run_for(tmp_path, runs, "old_run", d2)
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert warns == []                      # 只有一个已知指纹，谈不上"不一致"
+    assert any("old_run" in n for n in notes)
+
+
+def test_main_strict_fails_on_env_drift(tmp_path, capsys):
+    runs = tmp_path / "segment"
+    make_run_for(tmp_path, runs, "a", make_dataset(tmp_path, "ds_a", FP_A))
+    make_run_for(tmp_path, runs, "b", make_dataset(tmp_path, "ds_b", FP_B))
+    assert sa.main(["--runs-root", str(runs), "--strict"]) == 1
+    assert "转换环境不一致" in capsys.readouterr().out
+
+
+def test_main_no_env_check_suppresses(tmp_path, capsys):
+    runs = tmp_path / "segment"
+    make_run_for(tmp_path, runs, "a", make_dataset(tmp_path, "ds_a", FP_A))
+    make_run_for(tmp_path, runs, "b", make_dataset(tmp_path, "ds_b", FP_B))
+    assert sa.main(["--runs-root", str(runs), "--strict", "--no-env-check"]) == 0
+    assert "转换环境不一致" not in capsys.readouterr().out
+
+
+def test_main_prints_note_for_legacy_dataset(tmp_path, capsys):
+    runs = tmp_path / "segment"
+    make_run_for(tmp_path, runs, "legacy", make_dataset(tmp_path, "ds_old", None))
+    assert sa.main(["--runs-root", str(runs)]) == 0
+    assert "没有 env 指纹" in capsys.readouterr().out
+
+
+# ------------------------------------------- 合成数据集的指纹回退（synth_report.json）
+
+def test_dataset_env_falls_back_to_synth_report(tmp_path):
+    d = make_synth_dataset(tmp_path, "cp", FP_A)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) == FP_A
+
+
+def test_dataset_env_prefers_stats_over_synth(tmp_path):
+    """两个文件都在时以 dataset_stats.json 为准，顺序固定才好推理。"""
+    d = make_synth_dataset(tmp_path, "cp", FP_B)
+    (d / "dataset_stats.json").write_text(json.dumps({"env": FP_A}), encoding="utf-8")
+    assert sa.dataset_env({"data": str(d)}) == FP_A
+
+
+def test_dataset_env_synth_broken_json(tmp_path):
+    d = make_synth_dataset(tmp_path, "cp", FP_A, broken=True)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) is None
+
+
+def test_dataset_env_synth_without_env_field(tmp_path):
+    d = make_synth_dataset(tmp_path, "cp", None)
+    assert sa.dataset_env({"data": str(d / "data.yaml")}) is None
+
+
+def test_check_env_mixes_convert_and_synth_datasets(tmp_path):
+    """真实场景：B0 用转换集、B1 用合成集，两边指纹都读得到才比得起来。"""
+    runs = tmp_path / "segment"
+    make_run_for(tmp_path, runs, "b0_base", make_dataset(tmp_path, "ds_conv", FP_A))
+    make_run_for(tmp_path, runs, "b1_cp", make_synth_dataset(tmp_path, "ds_synth", FP_A))
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert warns == [] and notes == []
+
+
+def test_check_env_flags_synth_vs_convert_drift(tmp_path):
+    """转换集与合成集来自不同环境，同样要报出来——B0 与 B1 就没法比了。"""
+    runs = tmp_path / "segment"
+    make_run_for(tmp_path, runs, "b0_base", make_dataset(tmp_path, "ds_conv", FP_A))
+    make_run_for(tmp_path, runs, "b1_cp", make_synth_dataset(tmp_path, "ds_synth", FP_B))
+    recs = sa.collect(runs, None, "metrics/mAP50-95(M)", quiet=True)
+    warns, notes = sa.check_env(recs)
+    assert any("转换环境不一致" in w for w in warns)
+    assert any("b0_base" in w and "b1_cp" in w for w in warns)
+    assert notes == []

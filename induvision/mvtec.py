@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import platform
 import random
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,7 @@ __all__ = [
     "build_splits",
     "mask_to_polygons",
     "polygon_to_label_line",
+    "environment_fingerprint",
     "convert_dataset",
 ]
 
@@ -449,6 +451,30 @@ def _process_one(
     return rec
 
 
+def environment_fingerprint() -> Dict[str, str]:
+    """记录转换时的库版本，用于事后核对"多份数据集是不是同一个环境转出来的"。
+
+    为什么要记这个（踩过的坑）
+    --------------------------
+    ``cv2`` 4.10 与 5.0 的 ``findContours`` / ``approxPolyDP`` 在极少数轮廓上会给出
+    差约 1 像素的顶点。bottle + toothbrush 实测：同一份原始数据、同一组参数，
+    用 base 环境（cv2 4.10.0 / numpy 1.26.4）和 GPU 环境（cv2 5.0.0 / numpy 2.5.2）
+    各转一遍，788 个标签文件里有 **12 个不相同**，其中还包含 val 和 test 各 1 个。
+
+    后果很隐蔽：消融组之间本该"只有 train 不同、评测集完全一致"，
+    一旦两组数据集出自不同环境，val/test 的标签就已经悄悄变了，
+    指标差异再也归因不到那个被消融的变量上。
+
+    把指纹写进 ``dataset_stats.json``，``tools/summarize_ablation.py`` 就能自动查出来。
+    """
+    return {
+        "python": platform.python_version(),
+        "numpy": getattr(np, "__version__", "?"),
+        "cv2": getattr(cv2, "__version__", "?"),
+        "platform": platform.platform(),
+    }
+
+
 def _pct(values: Sequence[float], q: float) -> float:
     if not values:
         return 0.0
@@ -625,6 +651,7 @@ def convert_dataset(
             "area_fidelity_mean": round(float(np.mean(poly_fidelity)), 4) if poly_fidelity else 0.0,
             "area_fidelity_p10": _pct(poly_fidelity, 10),
         },
+        "env": environment_fingerprint(),
         "splits": split_stats,
         "categories": {k: cat_stats[k] for k in sorted(cat_stats)},
         "defect_area_ratio": {

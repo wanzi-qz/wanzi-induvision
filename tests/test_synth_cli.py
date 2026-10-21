@@ -267,3 +267,23 @@ def test_cli_all_pastes_rejected_fails_with_hint(tool, tiny_yolo, tmp_path: Path
     assert "--bg-std-min" in txt and "--min-visible" in txt
     assert not (out / "data.yaml").exists()
     assert not (out / "synth_manifest.csv").exists()
+
+
+def test_cli_report_records_env_fingerprint(tool, tiny_yolo, tmp_path: Path):
+    """synth_report.json 必须留下环境指纹。
+
+    合成不是"纯 numpy 拼图"，它同样要跑 cv2 的 findContours/approxPolyDP 把掩码
+    转成多边形：W2 实测 cv2 4.10 与 5.0 转出的标签有 12/788 个差约 1 像素，val/test
+    一旦不同，消融就不再是单变量对比。tools/summarize_ablation.py 靠这个字段交叉
+    核对各组的产出环境，所以这里必须写。
+    """
+    from induvision.mvtec import environment_fingerprint
+
+    out = tmp_path / "cp"
+    rc = tool.main(["--src", str(tiny_yolo.root), "--out", str(out),
+                    "--figures", "0", "--workers", "1"])
+    assert rc == 0
+    rep = _report(out)
+    assert rep["env"] == environment_fingerprint()
+    for key in ("python", "numpy", "cv2"):
+        assert rep["env"].get(key), f"env 里缺 {key}"

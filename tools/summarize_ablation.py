@@ -9,7 +9,10 @@
 1. 从 ``results.csv`` 取每组的 best epoch（按指定指标）与末轮值，输出 Markdown 表；
 2. 从 ``train_args.json``（本仓库训练入口写的）或 ultralytics 的 ``args.yaml`` 读回
    seed / imgsz / batch / epochs / patience / amp，做**协议一致性检查**：
-   谁和多数组不一致就点名，避免"以为是单变量对比、其实 batch 都不一样"。
+   谁和多数组不一致就点名，避免"以为是单变量对比、其实 batch 都不一样"；
+3. 回读各组数据集 ``dataset_stats.json`` / ``synth_report.json`` 里的转换环境指纹，查出"两份数据集是不同
+   conda 环境转出来的"这种更隐蔽的污染（cv2 4.10 与 5.0 的轮廓结果差约 1 像素，
+   会让本该完全一致的 val/test 悄悄不同）。
 
 用法
 ----
@@ -141,6 +144,70 @@ def summarize_run(run_dir: Path, metric: str) -> Optional[Dict[str, object]]:
     return rec
 
 
+ENV_KEYS = ("python", "numpy", "cv2")
+
+# 转换器写 dataset_stats.json；Copy-Paste 合成不写它，指纹在 synth_report.json 里
+ENV_FILES = ("dataset_stats.json", "synth_report.json")
+
+
+def dataset_env(cfg: Dict[str, object]) -> Optional[Dict[str, str]]:
+    """从 run 的 ``data`` 路径回溯数据集目录，按 ``ENV_FILES`` 顺序读 env 指纹。
+
+    读不到（文件不存在 / JSON 坏了 / 老数据集没这个字段）一律返回 ``None``，
+    由调用方决定是提示还是告警。
+    """
+    d = str(cfg.get("data") or "")
+    if not d:
+        return None
+    path = Path(d)
+    ds_dir = path.parent if path.suffix.lower() in (".yaml", ".yml") else path
+    for fname in ENV_FILES:
+        f = ds_dir / fname
+        if not f.exists():
+            continue
+        try:
+            env = json.loads(f.read_text(encoding="utf-8")).get("env")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(env, dict):
+            return env
+    return None
+
+
+def check_env(recs: Sequence[Dict[str, object]]) -> tuple:
+    """交叉核对各组数据集的转换环境。
+
+    返回 ``(warnings, notes)``：
+      * warnings —— 出现了**两个以上不同的已知指纹**，这会直接破坏单变量前提，
+        ``--strict`` 下应当失败；
+      * notes —— 只是有些 run 的数据集没有指纹（老数据集），不判失败。
+    """
+    per_run = {str(r["name"]): dataset_env(r.get("cfg") or {}) for r in recs}
+    known = {k: v for k, v in per_run.items() if v}
+    unknown = sorted(k for k, v in per_run.items() if not v)
+
+    variants: Dict[tuple, List[str]] = {}
+    for name, env in known.items():
+        key = tuple((k, str(env.get(k, "?"))) for k in ENV_KEYS)
+        variants.setdefault(key, []).append(name)
+
+    warns: List[str] = []
+    if len(variants) > 1:
+        warns.append("数据集转换环境不一致：不同 cv2/numpy 下 findContours/approxPolyDP")
+        warns.append("  会产出相差约 1 像素的标签，val/test 一旦不同，消融就不再是单变量对比")
+        for key, names in sorted(variants.items(), key=lambda kv: sorted(kv[1])):
+            warns.append(f"  {dict(key)} <- {', '.join(sorted(names))}")
+        warns.append("  受影响 run：" + ", ".join(sorted(known)))
+
+    notes: List[str] = []
+    if unknown:
+        notes.append("以下 run 的数据集没有 env 指纹（早于该字段引入，或 dataset_stats.json 缺失）："
+                     + ", ".join(unknown))
+        notes.append("  重跑 tools/convert_mvtec_to_yolo.py（合成集再加 tools/synthesize_defects.py）即可补上；"
+                     "同环境同参数产物逐字节相同")
+    return warns, notes
+
+
 def check_protocol(recs: Sequence[Dict[str, object]]) -> List[str]:
     """返回协议不一致的告警行；全一致则返回空列表。"""
     if len(recs) < 2:
@@ -226,7 +293,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--names", nargs="*", default=None, help="只看这些 run 名；不传则扫全部")
     ap.add_argument("--metric", default="metrics/mAP50-95(M)", choices=list(METRIC_COLS))
     ap.add_argument("--markdown", action="store_true", help="输出可直接贴进 docs/baseline.md 的表")
-    ap.add_argument("--strict", action="store_true", help="协议不一致或没有可用 run 时返回非零")
+    ap.add_argument("--strict", action="store_true", help="协议或转换环境不一致时返回非零")
+    ap.add_argument("--no-env-check", action="store_true",
+                    help="跳过数据集转换环境指纹核对")
     args = ap.parse_args(argv)
 
     recs = collect(Path(args.runs_root), args.names, args.metric)
@@ -235,6 +304,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     warns = check_protocol(recs)
+    env_warns, env_notes = ([], []) if args.no_env_check else check_env(recs)
+    warns = warns + env_warns
+
     if args.markdown:
         print(to_markdown(recs, args.metric))
     else:
@@ -246,6 +318,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("[warn] " + w if not w.startswith("  ") else w)
     else:
         print(f"\n[ok  ] {len(recs)} 组协议一致：{dict(zip(PROTOCOL_KEYS, recs[0]['protocol']))}")
+    for n in env_notes:
+        print("[note] " + n if not n.startswith("  ") else n)
 
     print("\n[note] 2 类子集的 val 只有 29 图 / 16 实例，这些绝对值只能读趋势，"
           "不能写简历（见 docs/baseline.md §3 读数警告）")

@@ -339,3 +339,29 @@ def test_env_check_tool_exists():
     assert (REPO_ROOT / "tools" / "env_check.py").is_file()
     assert (REPO_ROOT / "tools" / "download_mvtec.py").is_file()
     assert (REPO_ROOT / "tools" / "convert_mvtec_to_yolo.py").is_file()
+def test_environment_fingerprint_records_versions():
+    """转换环境要能被事后核对：cv2 4.10 与 5.0 的轮廓结果差约 1px（见函数 docstring）。"""
+    import cv2
+    import numpy as np
+
+    from induvision.mvtec import environment_fingerprint
+
+    fp = environment_fingerprint()
+    assert set(fp) == {"python", "numpy", "cv2", "platform"}
+    assert fp["cv2"] == cv2.__version__
+    assert fp["numpy"] == np.__version__
+    assert all(isinstance(v, str) and v for v in fp.values())
+
+
+def test_convert_dataset_writes_env_fingerprint(tiny_yolo, tmp_path):
+    """dataset_stats.json 必须带 env 字段，否则 summarize_ablation 的环境核对会失明。"""
+    import json
+
+    from induvision.mvtec import convert_dataset, environment_fingerprint
+    from conftest import build_mvtec_tree
+
+    src = build_mvtec_tree(tmp_path / "raw2")
+    out = tmp_path / "yolo_out"
+    convert_dataset(src, out, link="copy")
+    stats = json.loads((out / "dataset_stats.json").read_text(encoding="utf-8"))
+    assert stats["env"] == environment_fingerprint()

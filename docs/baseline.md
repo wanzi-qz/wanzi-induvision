@@ -120,7 +120,7 @@ focal 注入只能从这个入口开；它会把本次配置连同 focal 参数�
 
 | 编号 | 数据集 | focal | 想验证什么 | 结果 |
 | --- | --- | --- | --- | --- |
-| B0 | `out/yolo_bottle_tb` | 关 | 参照点 | 待测 |
+| B0 | `out/yolo_bottle_tb` | 关 | 参照点 | mask mAP50-95 **0.2453** @ ep75（95/100 早停，15.7 min） |
 | B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | 待测 |
 | B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | 待测 |
 | B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 待测 |
@@ -166,6 +166,43 @@ python tools/summarize_ablation.py --strict      # 各组 seed/imgsz/batch/epoch
 加 `--strict` 的意义在于：**消融最怕的不是指标难看，是"以为是单变量对比、其实 batch 都不一样"**，
 这种事靠记忆一定出错，交给脚本查。
 
+除了超参，它还会交叉核对**数据集是哪个环境转出来的**：读各组数据集目录下的
+`dataset_stats.json`（转换产物）或 `synth_report.json`（合成产物）里的 `env` 指纹，
+出现两个以上不同的已知指纹就告警，`--strict` 下直接失败；只是缺指纹（老数据集）则记为
+note，不判失败。这条是 W2 真踩出来的坑，见 §4 第 7 条。
+
+### 队列与中断恢复
+
+四组各 100 epoch，8GB 卡上一组约 16~20 分钟，连着跑要一小时以上，只能放后台。
+用 `tools/run_ablation_queue.ps1`，它是**幂等**的：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_ablation_queue.ps1
+```
+
+每组正常跑完时 `train_seg.py` 会落一份 `runs/segment/<name>/train_args.json`，
+脚本认这个文件跳过已完成的组；上卡前还会等显存降到 3GB 以下，避免和别的任务撞车。
+被中断的组不会留下 `train_args.json`，于是下次重跑自动重来 —— 这正是想要的：
+**消融宁可重跑，也不要拿一个截断的 run 去和跑满的 run 比**。
+
+这条不是纸上谈兵。2026-10-22 02:12:34 Windows Update 自动重启，B1 当时停在
+86/100（best@83，mask mAP50-95 0.3856）。因为 patience=20 且 best 在 83，它本该跑满
+100 epoch，这一组只能作废重跑；残留的 `results.csv` 与 `args.yaml` 已挪到
+`runs/_killed/b1_cp_ep86/` 留档（weights 226MB 丢弃，可复现）。
+
+想让它不随宿主 shell 一起被回收，用 WMI 建进程 —— 新进程的父级是 `WmiPrvSE.exe`，
+脱离了调用方的作业对象：
+
+```powershell
+Invoke-CimMethod -ClassName Win32_Process -Method Create -Arguments @{
+    CommandLine      = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<repo>\tools\run_ablation_queue.ps1"'
+    CurrentDirectory = '<repo>'
+}
+```
+
+这能挡住 shell 回收，**挡不住系统重启**。跑长任务前先把 Windows「活动时间」
+设成覆盖训练时段，或者分批跑。
+
 ### 每组要记的数
 
 box / mask 各自的 P、R、mAP50、mAP50-95，两个类分别的 AP，收敛 epoch，
@@ -195,3 +232,13 @@ box / mask 各自的 P、R、mAP50、mAP50-95，两个类分别的 AP，收敛 e
    仓库根没有这个文件，ultralytics 会转头去联网下载，国内网络下会卡很久。
 6. **`runs/segment/<name>/results.csv` 是唯一可信的指标来源**。控制台进度条会被
    `\r` 刷屏，日志里想按 epoch 取数得先过滤；直接读 csv 省事。
+7. **数据转换与合成必须固定同一个 Python 环境**。W2 实测：base 环境
+   （cv2 4.10.0 / numpy 1.26.4）与 GPU 环境（cv2 5.0.0 / numpy 2.5.2）转出的
+   788 个标签里有 **12 个差约 1 像素**，其中 val、test 各 1 个。评测集一旦不同，
+   "单变量对比"当场失效，而且指标看起来完全正常、不报任何错 —— 因为
+   `findContours` / `approxPolyDP` 的浮点行为随版本变。
+   现在两份产物都会写 `env` 指纹（转换器写 `dataset_stats.json`，合成写
+   `synth_report.json`），`summarize_ablation.py --strict` 查出两个指纹就失败。
+   补救办法是**用同一个环境重跑一遍转换/合成**：同环境同参数产物逐字节相同
+   （实测 789 与 870 个文件全等），可以安全覆盖。
+8. **长训练放后台要用幂等队列**，别手写 `Start-Process` 一串命令，见 §3「队列与中断恢复」。

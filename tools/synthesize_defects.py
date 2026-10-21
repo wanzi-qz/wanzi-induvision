@@ -18,7 +18,7 @@ python tools/synthesize_defects.py --src out/yolo_bottle_tb --dry-run
 ``images/{train,val,test}`` ``labels/{train,val,test}``：原图硬链接 + 合成图实文件
 ``data.yaml``              与源数据集同口径的类别表
 ``synth_manifest.csv``     每张合成图的完整审计（底板、贴了谁、变换、融合模式、可见比例）
-``synth_report.json``      配额计划、前后实例分布、多边形保真度、拒绝采样计数、耗时
+``synth_report.json``      配额计划、前后实例分布、多边形保真度、拒绝采样计数、环境指纹、耗时
 ``figures/``               抽查对比图（--figures N）
 
 防泄漏口径：缺陷贴片只从 train 划分抠（defect_bank 强制），val/test 原样硬链接，
@@ -57,7 +57,7 @@ from induvision.defect_bank import (  # noqa: E402
     load_bank,
     save_bank,
 )
-from induvision.mvtec import _place_file  # noqa: E402
+from induvision.mvtec import _place_file, environment_fingerprint  # noqa: E402
 from induvision.yolo_dataset import YoloImage, read_dataset, write_label_file  # noqa: E402
 
 
@@ -356,6 +356,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "rejected_sampling": rejected_total,
         "link_mode": args.link,
+        # 合成同样要跑 cv2 的 findContours/approxPolyDP，不同 cv2 版本会差约 1 像素，
+        # 所以这里也要留指纹，tools/summarize_ablation.py 会交叉核对
+        "env": environment_fingerprint(),
         "seconds": round(time.time() - t0, 2),
     }
     (out / "synth_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
