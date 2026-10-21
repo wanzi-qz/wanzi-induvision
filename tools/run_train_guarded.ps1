@@ -95,6 +95,9 @@ function Quarantine([string]$name, [int]$attempt) {
     if (Test-Path $csv) { $ep = (Get-Content $csv).Count - 1 }
     New-Item -ItemType Directory -Force -Path (Join-Path $root "runs\_killed") | Out-Null
     $leaf = "${name}_a${attempt}_ep${ep}"
+    # 同一次跑里可能反复搬同名残档（attempt 号与 ep 都相同时），加时间戳兜底，
+    # 否则 Move-Item 会把新残档塞进已存在的目录，事后分不清哪份是哪次崩的。
+    if (Test-Path (Join-Path $root "runs\_killed\$leaf")) { $leaf = "${leaf}_$(Get-Date -Format 'HHmmss')" }
     $dst = Join-Path $root "runs\_killed\$leaf"
     # 路径双保险：目标必须在 runs\_killed 下，叶节点名必须是自己拼出来的那个
     if (-not $dst.StartsWith((Join-Path $root "runs\_killed")) -or (Split-Path $dst -Leaf) -ne $leaf) {
@@ -111,6 +114,17 @@ if (-not (Test-Path $py))        { Log "!! abort：找不到 GPU 环境 $py"; ex
 $done = Join-Path $root "runs\segment\$Name\train_args.json"
 if (Test-Path $done) { Log "--- skip $Name：已完成（$done 存在）"; exit 0 }
 
+# 本脚本的契约是"从头跑满"，attempt=1 会把残档整体搬走重练。
+# 但残档里的 last.pt 其实能接着练 —— 15 类基线从头跑要 3 小时，续训只花剩下的。
+# 所以这里只提示不拦，让人自己决定走哪条路。
+$lastPt = Join-Path $root "runs\segment\$Name\weights\last.pt"
+if (Test-Path $lastPt) {
+    $ep0 = "-"; $csv0 = Join-Path $root "runs\segment\$Name\results.csv"
+    if (Test-Path $csv0) { $ep0 = (Get-Content $csv0).Count - 1 }
+    Log "!! 注意：$Name 有残档（已练到 ep=$ep0），本脚本会把它搬进 runs\_killed 从头重跑。"
+    Log "!!       想接着练省时间，请改用 tools\run_resume_chain.ps1（计划任务托管）。"
+}
+
 $cmd = @("tools/train_seg.py", "--data", $Data, "--model", "weights/yolov8s-seg.pt",
          "--name", $Name, "--epochs", "$Epochs") + $ExtraArgs
 Log "=== guard start (pid=$PID) name=$Name epochs=$Epochs maxAttempts=$MaxAttempts dry=$Dry ==="
@@ -122,6 +136,11 @@ for ($a = 1; $a -le $MaxAttempts -and -not $ok; $a++) {
     $g = Wait-Gpu
     if ($null -eq $g) { Log "!! abort：等了 15 分钟显存仍不空或 nvidia-smi 不可用"; exit 1 }
     Log ">>> start $Name  attempt=$a/$MaxAttempts  (gpu used=$($g.used)MiB temp=$($g.temp)C util=$($g.util)%)"
+
+    # attempt=1 也要清场：上一次进程被外力杀掉（Codex App 重启 / nvlddmkm TDR）时
+    # 残档还赖在 runs\segment\$Name。ultralytics exist_ok=True 只会 unlink 旧
+    # results.csv，混淆矩阵和 PR 曲线这些图不清，新旧混在一起事后没法看。
+    if ($a -eq 1) { Quarantine $Name 0 }
 
     $suffix = if ($a -eq 1) { "" } else { ".attempt$a" }
     & $py @cmd *>&1 | Out-File -FilePath (Join-Path $log "$Name$suffix.log") -Encoding utf8

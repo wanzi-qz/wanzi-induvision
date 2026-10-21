@@ -318,6 +318,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_ablation_queue.ps1
 想让它不随宿主 shell 一起被回收，用 WMI 建进程 —— 新进程的父级是 `WmiPrvSE.exe`，
 脱离了调用方的作业对象：
 
+> **⚠️ 下面这段「用 WMI 脱离宿主」的做法已被证伪（2026-10-22 04:12）**：
+> Codex 桌面 App 重启时，连 WMI 派生出来、父进程是 `WmiPrvSE.exe` 的
+> `run_b3_after.ps1`（PID 36840）也一起没了。改用 `tools/launch_task.ps1` 挂到 Task Scheduler 上，
+> 详见本节末尾「04:12 事故」。
+
 ```powershell
 Invoke-CimMethod -ClassName Win32_Process -Method Create -Arguments @{
     CommandLine      = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<repo>\tools\run_ablation_queue.ps1"'
@@ -340,6 +345,81 @@ Invoke-CimMethod -ClassName Win32_Process -Method Create -Arguments @{
 "一定会被打断，靠守护脚本自己爬起来"，而不是"想办法不被打断"。
 要降低概率可以从两头下手：驱动侧（616.92 这个版本一晚 TDR 两次，可以试回滚或换 Studio 驱动）、
 负载侧（关 Wallpaper Engine 之类常驻吃 GPU 的进程，别把显存逼到上限）。
+
+### 04:12 事故：进程链被 App 重启端掉，以及现在的正确做法
+
+**事故经过**。baseline15 练到 epoch 32 时（`results.csv` 最后写入 04:12:23）整条进程链
+消失：overnight（PID 27100）、guarded（11964）、train_seg（21480）、以及用 WMI 脱离出来的
+B3 排队器（36840）全部不在了。事件日志里没有任何 python 崩溃、没有 nvlddmkm 事件、
+开机时间也没变（仍是 02:12:34）—— **不是驱动问题，也不是重启**。
+真正的证据在进程启动时间上：所有 `ChatGPT.exe` / `codex.exe` 都是 **04:13:49** 之后起的。
+也就是说：**Codex 桌面 App 一重启，就把它 shell 派生的整棵子进程树带走了**，
+连 WMI `Win32_Process.Create` 脱离出去的那个也没活下来。
+
+**现在的做法：超过 10 分钟的活一律挂 Task Scheduler**。任务由服务启动，
+进程不属于任何 App 的 job object，App 重启 / 终端关闭 / 锁屏都动不了它。
+
+```powershell
+# 挂上去（-HardenPower 会顺手把 AC/DC 睡眠与休眠超时设成从不）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\launch_task.ps1 `
+    -Script tools\run_resume_chain.ps1 -HardenPower
+
+# 看状态 / 停 / 删
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\launch_task.ps1 -Status
+Stop-ScheduledTask  -TaskName InduVision_run_resume_chain
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\launch_task.ps1 `
+    -TaskName InduVision_run_resume_chain -Unregister
+```
+
+任务参数：`-ExecutionTimeLimit 6h`、`-RestartCount 3`（失败自动重起）、
+`-MultipleInstances IgnoreNew`（重复触发不会抢显存）。`Get-ScheduledTaskInfo` 的
+`LastTaskResult` 里 **267009 = 正在运行**、**2147946720 = 触发器撞上已运行实例被忽略**，
+两个都不是错误，别误读。
+
+**断点续训比从头重跑划算得多**。`tools/run_resume_chain.ps1` 就是为这个场景写的：
+
+```powershell
+# 从 last.pt 接着练满 -> test 逐类评测 -> 汇总 -> 自动接 B3 -> 再汇总
+& W:\Anaconda\envs\induvision\python.exe tools/train_seg.py `
+    --data out/yolo_mvtec15/data.yaml `
+    --model runs/segment/baseline15/weights/last.pt `
+    --name baseline15 --epochs 100 --resume
+```
+
+两个必须记住的口径问题：
+
+1. **续训不能走 `run_train_guarded.ps1`**。它的失败兑底是 `Quarantine` —— 把整个 run
+   目录挪进 `runs/_killed`。这对「从头重跑」是对的，对「续训」是灾难：
+   `last.pt` 被挪走后下一次 attempt 就无档可续。所以 guarded 现在只提示不拦，
+   `残档存在时会在日志里叫你改用 run_resume_chain.ps1`。ultralytics 的 `resume=True`
+   会恢复优化器状态、接着 `results.csv` 往后写、epoch 号连续，所以失败就地再续，不搬目录。
+2. **续训后 `train_args.json` 的 `model` 字段会记成 `last.pt` 的路径**，不再是
+   `weights/yolov8s-seg.pt`。`summarize_ablation.py` 的 `PROTOCOL_KEYS` 是
+   `(seed, imgsz, batch, epochs, patience, amp)`，**不含 `model`**，所以 `--strict` 不受影响；
+   权重初值也确实是同一个 yolov8s-seg.pt，只是中途接着练。
+
+实测收益：04:28 关掉腾讯视频/弹幕/迅雷缩略图后显存从 3421 MiB 降到 1576 MiB，
+单 epoch 从 **105 s 降到 78 s（-26%）**。腾显存不只是为了不 OOM，是直接换时间的。
+
+**两个脚本的 attempt=1 清场修复已经对齐**。上一节提到 `run_train_guarded.ps1`
+当时没改（正在跑 baseline15，不去动一个正在执行的文件），现在已补上：
+`Quarantine` 里加了同名残档的时间戳去重，循环里加了 `if ($a -eq 1) { Quarantine $Name 0 }`，
+与 `run_ablation_queue.ps1` 同一套逻辑。
+
+**B3 落盘验收已固化成工具**。之前是 `out/_verify_b3.py` 一次性脚本（硬编码路径与
+97/194 这些魔数），现在是 `tools/verify_oversample.py` + `tests/test_verify_oversample.py`（21 个用例）：
+
+```powershell
+# 不信 oversample_report.json 的自述，从磁盘重算一遍再对账，34 项全过才返回 0
+W:\Anaconda\python.exe tools/verify_oversample.py `
+    --src out/yolo_bottle_tb --dst out/yolo_bottle_tb_os `
+    --json-out runs/logs/verify_b3.json
+```
+
+守的是三条铁律：副本逐字节等于源（过采样不是数据增强）、val/test 一个字节都不动
+（否则早停选出来的 best.pt 不可信）、只复制带缺陷的图（复制背景只会稀释正样本比例）。
+测试里每一条都靠 **先 unlink 再写** 来造故障 —— oversample 是硬链接落盘，
+直接 `write_bytes` 会连源文件一起改，两边 sha256 依旧相等，验收照样 PASS，测试就成了摆设。
 
 ### 每组要记的数
 

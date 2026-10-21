@@ -112,6 +112,17 @@ ONNX 在本项目里的角色是"导出中间格式 + 数值对齐校验"，CPU 
 4. 显存只有 8 GB：训练用 YOLOv8s-seg、imgsz=640、batch 8~16 起步，不要上 l/x 型号。
 5. 磁盘余量：C 盘 186.7 GB，W 盘 287.3 GB（本环境装在 W 盘）。
 
+6. **Codex 桌面 App 重启会杀掉它 shell 派生的整棵子进程树**，WMI
+   `Win32_Process.Create` 脱离也保不住（2026-10-22 04:12 实测，baseline15 练到
+   epoch 32 被端掉）。超过 10 分钟的活一律用 `tools/launch_task.ps1` 挂到
+   Task Scheduler 上：任务由服务启动，不属于任何 App 的 job object。
+7. **本机是 S0 新型待机，AC 睡眠超时出厂就是 600 秒（10 分钟）**，03:24 真进过
+   一次待机。长训练前先 `powercfg /change standby-timeout-ac 0`
+   （`launch_task.ps1 -HardenPower` 会做），否则随时可能被待机打断。
+8. **8GB 显存要先腾干净再上卡**。腾讯视频 / 弹幕 / 迅雷缩略图这类常驻 GPU 的
+   娱乐进程能占掉 2GB 以上；04:28 关掉后显存 3421→1576 MiB，baseline15 单 epoch
+   从 105 s 降到 78 s（-26%），而且余量更大、TDR 风险更低。
+
 ## 8. 许可与数据合规
 
 - 权重 `yolov8s-seg.pt` 与 Ultralytics 代码为 **AGPL-3.0**；MVTec AD 数据集为
