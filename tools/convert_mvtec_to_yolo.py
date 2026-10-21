@@ -128,7 +128,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.dry_run:
         print("\n下一步训练（8GB 显存建议 imgsz=640 batch=8）：")
         print(f"  yolo segment train data={rep.data_yaml} model=yolov8s-seg.pt "
-              f"imgsz=640 batch=8 epochs=100 patience=20 project=runs name=baseline")
+              f"imgsz=640 batch=8 epochs=100 patience=20 name=baseline")
+        print("  # 不传 project，产物落在 runs/segment/baseline；")
+        print("  # 传 project=runs 会被拼成 runs/segment/runs/baseline，多一层没用的嵌套。")
     return 0
 
 

@@ -51,7 +51,8 @@ python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_mvtec
 
 # 3) 训练。8GB 显存：s 型号 + imgsz 640 + batch 8 起步
 yolo segment train data=out/yolo_mvtec/data.yaml model=weights/yolov8s-seg.pt `
-     imgsz=640 batch=8 epochs=100 patience=20 project=runs name=baseline
+     imgsz=640 batch=8 epochs=100 patience=20 name=baseline
+# 产物落在 runs/segment/baseline。别传 project=runs，会拼成 runs/segment/runs/baseline
 
 # 4) 单测（36 条 / 约 4 秒）
 python -m pytest -q
@@ -91,6 +92,8 @@ bottle + toothbrush 冒烟集（487 文件 / 254 MB，2026-10-21）：
 | 缺陷面积占比 | mean 5.85%，p50 3.50%，min 0.24%，max 27.42% |
 | 缺陷图占比 | 93/394 = 23.6%，背景负样本是其 3.2 倍 |
 | GPU 自检 | YOLOv8s-seg 单图推理 22.76 ms（640，预热后），峰值显存 123 MiB |
+| 训练冒烟 | 13 epoch 跑通 训练→验证→保存，显存 4.34 GiB @ batch8/640/AMP off，3.4 it/s |
+| CI 首轮 | ubuntu + windows × py3.10/3.12 共 4 job 全绿 |
 | ONNX 导出 | 成功，45.40 MB，opset 17，dynamic batch，onnx.checker 通过 |
 
 这两行数字直接指出了 W2 要解决什么：**缺陷样本稀缺（23.6%）+ 目标极小（p50 3.5%）**，
