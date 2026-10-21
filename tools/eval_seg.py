@@ -93,6 +93,12 @@ def _per_class(metric, names: Sequence[str]) -> List[Dict[str, object]]:
     return rows
 
 
+def _seg_metric(metrics):
+    """Ultralytics 分割指标属性名：8.4.x 叫 seg，早期叫 mask。两种都兼容，避免 AttributeError。"""
+    seg = getattr(metrics, "seg", None)
+    return seg if seg is not None else getattr(metrics, "mask", None)
+
+
 def _md_table(rows: Sequence[Dict[str, object]], title: str) -> List[str]:
     out = [f"**{title}**", "", "| 类 | P | R | mAP50 | mAP50-95 |", "| --- | --- | --- | --- | --- |"]
     for r in rows:
@@ -161,8 +167,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     names_map = metrics.names
     names = [names_map[i] for i in sorted(names_map)] if isinstance(names_map, dict) else list(names_map)
+    seg_metrics = _seg_metric(metrics)
     box_rows = _per_class(metrics.box, names)
-    mask_rows = _per_class(metrics.mask, names)
+    mask_rows = _per_class(seg_metrics, names)
 
     def _g(obj, key):
         v = getattr(obj, key, None)
@@ -171,8 +178,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = {
         "box": {"P": _g(metrics.box, "mp"), "R": _g(metrics.box, "mr"),
                 "mAP50": _g(metrics.box, "map50"), "mAP50-95": _g(metrics.box, "map")},
-        "mask": {"P": _g(metrics.mask, "mp"), "R": _g(metrics.mask, "mr"),
-                 "mAP50": _g(metrics.mask, "map50"), "mAP50-95": _g(metrics.mask, "map")},
+        "mask": {"P": _g(seg_metrics, "mp"), "R": _g(seg_metrics, "mr"),
+                 "mAP50": _g(seg_metrics, "map50"), "mAP50-95": _g(seg_metrics, "map")},
     }
 
     payload = {

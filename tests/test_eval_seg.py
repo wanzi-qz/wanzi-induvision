@@ -49,6 +49,35 @@ def test_per_class_handles_empty_index(tool):
     ]
 
 
+class _FakeSegMetrics:
+    """仿 ultralytics 8.4.x SegmentMetrics：只有 box/seg，没有 mask 属性。"""
+
+    def __init__(self, seg_attr="seg"):
+        self.names = {0: "bottle", 1: "cable"}
+        self.box = FakeMetric({0: (0.6, 0.5, 0.4, 0.3)})
+        seg = FakeMetric({0: (0.5, 0.4, 0.3, 0.2)})
+        if seg_attr == "seg":
+            self.seg = seg
+        else:
+            self.mask = seg
+
+
+def test_seg_metric_prefers_seg(tool):
+    m = _FakeSegMetrics("seg")
+    assert tool._seg_metric(m) is m.seg
+
+
+def test_seg_metric_falls_back_to_mask(tool):
+    m = _FakeSegMetrics("mask")
+    assert tool._seg_metric(m) is m.mask
+
+
+def test_seg_metric_returns_none_when_neither(tool):
+    class Bare:
+        pass
+    assert tool._seg_metric(Bare()) is None
+
+
 def test_md_table_shape_and_dash_for_none(tool):
     rows = tool._per_class(FakeMetric({0: (0.5, 0.4, 0.3, 0.2)}), ["bottle", "cable"])
     lines = tool._md_table(rows, "mask 逐类（split=test）")

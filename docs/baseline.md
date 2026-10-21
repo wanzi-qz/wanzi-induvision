@@ -143,12 +143,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_overnight.ps1
 | 指标 | 值 |
 | --- | --- |
 | 数据集规模（图 / 实例 / 类） | train 4490 图 / 1261 实例，val 429 / 299，test 435 / 328，15 类（见上） |
-| box mAP50-95 / mAP50 | 待测 |
-| mask mAP50-95 / mAP50 | 待测 |
-| 单类 AP（15 类逐个） | 待测 |
-| 混淆矩阵 | 待测（`runs/segment/baseline15/confusion_matrix.png`） |
-| 收敛 epoch / 总时长 | 待测 |
-| 峰值显存 / 迭代速度 | 待测 |
+| box mAP50-95 / mAP50 | **0.4229 / 0.6652**（test split，best.pt @ val ep75） |
+| mask mAP50-95 / mAP50 | **0.3740 / 0.6730**（test split）；mask P / R 0.7246 / 0.6346 |
+| 单类 AP（15 类逐个） | mask mAP50-95 高→低：tile 0.653 · bottle 0.598 · zipper 0.528 · wood 0.441 · pill 0.410 · metal_nut 0.406 · screw 0.396 · hazelnut 0.364 · carpet 0.356 · grid 0.283 · leather 0.263 · capsule 0.260 · cable 0.239 · transistor 0.219 · toothbrush 0.193；box / mask 完整逐类表见 `runs/logs/baseline15_eval_test.md` |
+| 混淆矩阵 | `runs/segment/baseline15/confusion_matrix.png`（归一化版 `confusion_matrix_normalized.png` 同出） |
+| 收敛 epoch / 总时长 | best @ ep75，ep95 早停（patience=20，未跑满 100）；04:12 中断后从 ep32 断点续训至早停，续训段实测 78 min · 约 73 s/epoch |
+| 峰值显存 / 迭代速度 | 训练显存约 3.0 GB（batch=8 / imgsz=640），整卡峰值约 4.9 GB（nvidia-smi）；562 iter/epoch · 约 8 it/s；test 推理 8.1 ms/图（435 图 / 26.9 s） |
+
+> **口径说明**：best.pt 由 val 早停选出（val best mask mAP50-95 **0.4026** @ ep75）；表中 test-split 数字才是能写进简历的最终成绩（mask 0.3740 / box 0.4229），比 val 低约 7%（相对），属正常泛化差。数据来源 `runs/segment/baseline15/eval_test.json`（git 5dc2d20）。
 
 ## 3. W2 消融
 
@@ -167,14 +169,14 @@ focal 注入只能从这个入口开；它会把本次配置连同 focal 参数�
 | B0 | `out/yolo_bottle_tb` | 关 | 参照点 | mask mAP50-95 **0.2453** @ ep75（95/100 早停，15.7 min） |
 | B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | mask mAP50-95 **0.4071** @ ep81（跑满 100，16.8 min）；对 B0 **+0.1618**（+66%）。mask mAP50 0.4736→0.6824，box mAP50-95 0.2517→0.4554，mask P/R 0.9025/0.6032 |
 | B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | mask mAP50-95 **0.0039** @ ep27（31/100 早停，4.6 min）；mask P/R 0.0003/0.2778，box mAP50-95 0.0021，val 的 box/cls/dfl loss 全是 nan，彻底学崩。第一轮 02:56 被 nvlddmkm TDR 打死在 ep29（`_queue.log` 记为 exit=1），03:14 补跑时同名 run 目录被 ultralytics **原地覆盖**，第一轮残档已丢 —— 现在 `runs/logs/b2_focal.log` 和 `runs/segment/b2_focal/` 里全是补跑那轮的东西。补跑这轮完整跑完，所以“学崩”与驱动无关；覆盖这个坑见「队列与中断恢复」 |
-| B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 数据集已落盘并验收（2026-10-22 03:52，train **401 图 / 194 实例**，副本 66 图 + 66 标签，val/test 与源逐字节一致）；训练已排队（`tools/run_b3_after.ps1` 等 overnight 退出后自动上卡），指标待测 |
+| B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | mask mAP50-95 **0.4003** @ ep98（跑满 100，12.5 min）；mask P/R 0.7454 / 0.7302，mask mAP50 0.7094，box mAP50-95 0.4321。对 B0（0.2453）**+0.1550**（+63%），与 B1 Copy-Paste 合成（0.4071）基本持平（差 0.0068）——详见下面第 4 点 |
 | B4 | `out/yolo_bottle_tb_nogood` | 关 | 关掉 good 背景负样本，量化它对误检率的抑制 | mask mAP50-95 **0.0109** @ ep3（23/100 早停，1.5 min）；mask P/R 0.0833/0.0714，基本没学起来。**但这组不能直接归因给背景负样本，见下面 B4 的口径问题** |
 | C1 | `out/yolo_bottle_tb_cp` | γ=2.0 α=0.25 | B1+B2 叠加：两个手段是否互补 | mask mAP50-95 **0.1953** @ ep91（跑满 100，14.6 min）。比 B1 的 0.4071 **低 0.2118**，甚至低于 B0 基线 —— 在这个规模上 focal 是**负收益**，叠加也救不回来 |
 
 B1 vs B3 是这组里最有信息量的一对：如果"把旧图复制几遍"就能拿到和"合成新像素"
 差不多的收益，那 Copy-Paste 那套工程复杂度就不值得；反过来才说明合成管线有必要。
 
-### 本轮读出来的三件事
+### 本轮读出来的四件事
 
 **1. Copy-Paste 合成是真有效，而且幅度不小。** B1 对 B0：mask mAP50-95
 0.2453 → 0.4071（+0.1618，相对 +66%），mask mAP50 0.4736 → 0.6824，
@@ -196,6 +198,15 @@ train 只剩 **66 图 / 9 batch-iter**，23 epoch 早停 = 总共约 **207 次�
 **不能直接说成"背景负样本贡献了 0.23 个 mAP"**。要重做就得把步数对齐：
 要么 `--epochs` 提到 ~600 让它跑够迭代，要么固定 `nbs` / 关掉 warmup 占比过高的前 3 轮。
 这一条留着，等 15 类全量基线出来再决定要不要补。
+
+**4. 整张复制的过采样（B3）和 Copy-Paste 合成（B1）在这个规模上基本打平，合成管线的边际收益很小。**
+B3 mask mAP50-95 **0.4003** @ ep98，B1 是 **0.4071** @ ep81，差只有 **0.0068**（B1 相对高 1.7%），
+两者都把 B0 基线 0.2453 甩开一大截（+63% / +66%）。但两组用的是同一个小 val（29 图 / 16 实例），
+且 B3 train 401 图 / 194 实例、B1 是 375 图 / 206 实例 —— 迭代步数与实例数并不严格等量，
+只能读趋势。方向性结论是：**对"缺陷已经在真实原图里出现过"的稀有类，把原图整张复制、
+把类别比例拉平，就能拿到大半收益；Copy-Paste 那套"合成新像素"的额外工程，在这个规模上
+只换来个位数千分点的边际**。只有当缺陷在原始图像里根本不出现、或需要合成新的上下文 / 纹理时，
+合成管线的价值才真正显现 —— 这需要在 15 类全量（§2 基线）上复测才能定论。
 
 ### 数字怎么用
 

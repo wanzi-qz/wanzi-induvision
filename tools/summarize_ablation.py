@@ -272,7 +272,8 @@ def collect(runs_root: Path, names: Optional[Sequence[str]], metric: str,
         raise SystemExit(f"[err ] 找不到 runs 目录：{runs_root}")
     recs, missing = [], []
     targets = [runs_root / n for n in names] if names else sorted(
-        d for d in runs_root.iterdir() if d.is_dir())
+        d for d in runs_root.iterdir()
+        if d.is_dir() and "_eval_" not in d.name)
     for d in targets:
         rec = summarize_run(d, metric) if d.exists() else None
         if rec is None:
