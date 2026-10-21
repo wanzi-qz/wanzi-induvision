@@ -1,0 +1,22 @@
+# 环境与产物
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 权重与导出产物（体积大 + AGPL-3.0 许可，不入库）
+weights/
+*.pt
+*.onnx
+*.engine
+*.trt
+
+# 数据集（MVTec AD 为 CC BY-NC-SA 4.0 非商用，只入库脚本不入库数据）
+data/*
+!data/README.md
+
+# 运行输出
+out/
+runs/
+ci-out/

@@ -1,0 +1,18 @@
+# 仓库内一律 LF，避免 Windows 检出成 CRLF 后与 CI 的 bash 步骤行为不一致
+* text=auto
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+*.sh    text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.bmp   binary
+*.pt    binary
+*.onnx  binary
+*.engine binary

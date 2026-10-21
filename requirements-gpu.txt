@@ -1,0 +1,19 @@
+# 工业缺陷检测项目 GPU 环境（conda env: induvision）
+# 复现：conda create -n induvision --clone yoloworld
+#       pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-gpu.txt
+# 说明：torch / torchvision 由克隆继承（cu130 版），不要从 PyPI 重装，否则会覆盖成 CPU 版。
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+numpy==2.5.2
+opencv-python==5.0.0.93
+pillow==12.3.0
+scipy==1.18.1
+scikit-image==0.26.0
+pandas==3.0.6
+matplotlib==3.11.2
+ultralytics==8.4.183
+ultralytics-thop==2.2.3
+onnx==1.23.2
+onnxruntime==1.31.0
+onnxslim==0.1.98
+pytest==9.1.1

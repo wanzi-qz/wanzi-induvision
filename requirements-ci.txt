@@ -1,0 +1,10 @@
+# CI 专用依赖：只装跑通转换管线与单测所需的最小集合。
+# 刻意不装 torch / ultralytics —— 转换阶段与 30 条单测都不需要 GPU，
+# CI 装 torch 会把作业时长从 ~1min 拉到 ~6min，收益为零。
+# 本地 GPU 环境见 requirements-gpu.txt 与 docs/environment.md。
+#
+# 安装：pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-ci.txt
+numpy>=1.26,<3
+opencv-python-headless>=4.9
+PyYAML>=6.0
+pytest>=8.0
