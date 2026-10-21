@@ -69,10 +69,11 @@ function Log($m) {
     "$(Get-Date -Format 'MM-dd HH:mm:ss')  $m" | Tee-Object -FilePath (Join-Path $log "_queue.log") -Append
 }
 
-# 编号口径见 docs/baseline.md §3。B3（过采样）还缺落盘 CLI，不排进本轮。
+# 编号口径见 docs/baseline.md §3。B3 的数据集由 tools/oversample_dataset.py 落盘（out/yolo_bottle_tb_os），已排进队列。
 $jobs = @(
     @{ n = "b1_cp";       d = "out/yolo_bottle_tb_cp/data.yaml";     f = @() }
     @{ n = "b2_focal";    d = "out/yolo_bottle_tb/data.yaml";        f = @("--focal-gamma", "2.0", "--focal-alpha", "0.25") }
+    @{ n = "b3_oversample"; d = "out/yolo_bottle_tb_os/data.yaml"; f = @() }
     @{ n = "c1_cp_focal"; d = "out/yolo_bottle_tb_cp/data.yaml";     f = @("--focal-gamma", "2.0", "--focal-alpha", "0.25") }
     @{ n = "b4_nogood";   d = "out/yolo_bottle_tb_nogood/data.yaml"; f = @() }
 )

@@ -167,7 +167,7 @@ focal 注入只能从这个入口开；它会把本次配置连同 focal 参数�
 | B0 | `out/yolo_bottle_tb` | 关 | 参照点 | mask mAP50-95 **0.2453** @ ep75（95/100 早停，15.7 min） |
 | B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | mask mAP50-95 **0.4071** @ ep81（跑满 100，16.8 min）；对 B0 **+0.1618**（+66%）。mask mAP50 0.4736→0.6824，box mAP50-95 0.2517→0.4554，mask P/R 0.9025/0.6032 |
 | B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | mask mAP50-95 **0.0039** @ ep27（31/100 早停，4.6 min）；mask P/R 0.0003/0.2778，box mAP50-95 0.0021，val 的 box/cls/dfl loss 全是 nan，彻底学崩。第一轮 02:56 被 nvlddmkm TDR 打死在 ep29（`_queue.log` 记为 exit=1），03:14 补跑时同名 run 目录被 ultralytics **原地覆盖**，第一轮残档已丢 —— 现在 `runs/logs/b2_focal.log` 和 `runs/segment/b2_focal/` 里全是补跑那轮的东西。补跑这轮完整跑完，所以“学崩”与驱动无关；覆盖这个坑见「队列与中断恢复」 |
-| B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 待测 |
+| B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 数据集已落盘并验收（2026-10-22 03:52，train **401 图 / 194 实例**，副本 66 图 + 66 标签，val/test 与源逐字节一致）；训练已排队（`tools/run_b3_after.ps1` 等 overnight 退出后自动上卡），指标待测 |
 | B4 | `out/yolo_bottle_tb_nogood` | 关 | 关掉 good 背景负样本，量化它对误检率的抑制 | mask mAP50-95 **0.0109** @ ep3（23/100 早停，1.5 min）；mask P/R 0.0833/0.0714，基本没学起来。**但这组不能直接归因给背景负样本，见下面 B4 的口径问题** |
 | C1 | `out/yolo_bottle_tb_cp` | γ=2.0 α=0.25 | B1+B2 叠加：两个手段是否互补 | mask mAP50-95 **0.1953** @ ep91（跑满 100，14.6 min）。比 B1 的 0.4071 **低 0.2118**，甚至低于 B0 基线 —— 在这个规模上 focal 是**负收益**，叠加也救不回来 |
 
@@ -221,8 +221,35 @@ python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_bottle
 python tools/train_seg.py --data out/yolo_bottle_tb_nogood/data.yaml --model weights/yolov8s-seg.pt --name b4_nogood --epochs 100
 ```
 
-B3 还差一个落盘 CLI：配额函数 `balance.plan_oversample()` 已经写好也有单测，
-但没有对应的 `tools/` 入口把它变成数据集目录，所以 B3 目前是**待实现**状态，不排进本轮。
+B3 的落盘 CLI 已经补上了：`tools/oversample_dataset.py`（配额仍走 `balance.plan_oversample()`）。
+
+```powershell
+# 只看配额不写盘
+python tools/oversample_dataset.py --src out/yolo_bottle_tb --out out/yolo_bottle_tb_os --target-per-class 100 --dry-run
+# 落盘：必须用 base 环境（W:\Anaconda\python.exe），它会拿当前环境指纹和源数据集的 env 对一遍，不一致直接报错
+python tools/oversample_dataset.py --src out/yolo_bottle_tb --out out/yolo_bottle_tb_os --target-per-class 100
+python tools/train_seg.py --data out/yolo_bottle_tb_os/data.yaml --model weights/yolov8s-seg.pt --name b3_oversample --epochs 100
+```
+
+`--target-per-class 100` 是对齐 B1 的计划（B1 也把每类推到 ~100 实例）：
+bottle 50→100、toothbrush 47→94，各 ×1，复制 66 张缺陷原图 →
+**train 335→401 图、97→194 实例**。B1 是 375 图 / 206 实例，两组并不严格等量：
+**B3 的迭代步数比 B1 少约 7%、实例少约 6%**，读结果时必须把这点差异一起说出来，
+不能当成等量对比（B4 就是栽在步数不可比上）。
+
+三条铁律，由 `tests/test_oversample_cli.py` 的 20 个用例守着：
+
+* `val` / `test` 逐文件原样硬链接，一个字节都不动 —— 评测集必须和 B0/B1/B2 完全一致；
+* 副本的图片和标签**都硬链接自源文件**，标签逐字节相同，
+  不存在“反归一化再归一化”的多边形往返误差；
+* 背景图（good）不复制 —— 过采样针对的是稀有缺陷类，不是负样本。
+
+落盘自查全过：132 个文件 sha256 全部匹配、val/test 与源一致、train 规模符合预期、
+环境指纹与源相同（python 3.12.3 / numpy 1.26.4 / cv2 4.10.0）。除数据集目录外还落
+`manifest.csv`（继承源 schema，副本行沿用源图的 category / defect_type）、
+`dataset_stats.json`（`splits` 按含副本重算；`categories` / `polygon` 这类唯一图维度的统计不放大）
+和 `oversample_report.json`（配额、每类倍数、校验结果、指纹、耗时）。重跑幂等：
+上一轮遗留的孤儿副本（`os__` 前缀）会被清掉，源文件名一个都不碰。
 
 B4 要留意一点：`--no-good-train` 只动 train，val / test 里的 good 背景图照旧保留，
 所以它和 B0 的评测集是同一批图 —— 这才是干净的单变量对比，误检率的差异才归因得到这一个开关上。
@@ -297,6 +324,17 @@ Invoke-CimMethod -ClassName Win32_Process -Method Create -Arguments @{
     CurrentDirectory = '<repo>'
 }
 ```
+
+**同一张卡上排多个长任务时，别指望 `Wait-Gpu`，要按 PID 等。**
+队列里的 `Wait-Gpu` 只轮询 10 分钟（60 次 × 10 秒），等不到就往下走 ——
+前面那个任务要是还得跑两小时，这层保护等于没有。B3 就是这么排的：
+`tools/run_b3_after.ps1 -WaitPid <overnight 的 PID>` 盯着 `run_overnight.ps1` 主进程，
+退出后再睡 90 秒让显存和文件句柄释放，然后 `run_ablation_queue.ps1 -Only b3_oversample`
+上卡，跑完顺手刷新 `runs/logs/ablation_summary.md`。它自己也是 WMI 脱离宿主挂的，
+日志在 `runs/logs/_b3_queue.log`，上卡前还会读一遍 `oversample_report.json` 体检
+（val/test 不一致或指纹不匹配就直接 abort，宁可不出数也不出脏数）。
+走队列而不是直接调 `run_train_guarded.ps1`，还有一层原因：`attempt=1` 前清场那个修复
+目前只在队列里，guarded 要等 baseline15 跑完才同步。
 
 这能挡住 shell 回收，**挡不住蓝屏**。这台机器上长任务的现实预期是
 "一定会被打断，靠守护脚本自己爬起来"，而不是"想办法不被打断"。
