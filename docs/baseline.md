@@ -77,9 +77,37 @@
 
 ---
 
-## 2. W1b 正式基线（待跑）
+## 2. W1b 正式基线（15 类全量）
 
 协议先固定下来，跑完把数字填进表格，**不预先填任何值**。
+§3 的两类子集只用来做趋势消融，**能写进简历的数只能来自这一节**。
+
+### 数据已就位（2026-10-22 03:05）
+
+`download_mvtec.py --source hf` 从 hf-mirror 拉完 15 类全量，逐文件 sha256 对过 HF LFS 的
+`lfs.oid`，校验通过：**5354 张**（官方 train/good 3629 + test 467 good + 1258 缺陷，
+ground_truth 掩码 1258 份）。约 12 分钟，均速 5~7 MB/s，支持断点续传，`data/` 不入库。
+
+`convert_mvtec_to_yolo.py` 27.7 s 转完，硬链接落盘（不额外占 4.9GB），
+环境指纹与 §3 三个子集一致（Python 3.12.3 / numpy 1.26.4 / cv2 4.10.0），
+`--strict` 汇总时不会被判成跨环境漂移。
+
+**这里有个必须说清楚的口径决定**：MVTec 官方 `train/` 全是正常样本，那是给无监督异常检测用的；
+做**有监督**缺陷分割必须拿缺陷图训练，而缺陷图全在官方 `test/` 里。所以转换器把
+官方 test 的 1258 张缺陷图 + 467 张 good 重新按 `category×defect_type` 分层切成
+train/val/test = 0.70/0.15/0.15（seed=0），官方 train/good 3629 张整体作为背景负样本进 train：
+
+| split | 图 | 其中缺陷图 | 其中背景图 | 实例 |
+| --- | --- | --- | --- | --- |
+| train | 4490 | 861 | 3629 | 1261 |
+| val | 429 | 198 | 231 | 299 |
+| test | 435 | 199 | 236 | 328 |
+
+缺陷面积占比 mean 4.39% / p50 1.54% / p90 9.51% / max 49.32%；
+`approxPolyDP` eps=0.002×周长、min_area=4 px，平均 41.9 顶点/多边形，面积保真度 0.9764。
+**val 有 299 个实例，比 §3 那 16 个高一个数量级**，这一节的数字才有资格往外写。
+
+### 命令
 
 ```powershell
 conda activate induvision
@@ -92,13 +120,29 @@ python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_mvtec1
 python tools/train_seg.py --data out/yolo_mvtec15/data.yaml `
      --model weights/yolov8s-seg.pt --name baseline15 --epochs 100
 # 默认就是 imgsz=640 / batch=8 / patience=20 / seed=0 / amp=True，不用逐个敲
+
+# best.pt 是靠 val 早停选出来的，最终成绩要在没参与过任何决策的 test split 上重算
+python tools/eval_seg.py --weights runs/segment/baseline15/weights/best.pt `
+     --data out/yolo_mvtec15/data.yaml --split test --name baseline15 --markdown
+```
+
+4490 张 train 图 = 562 iter/epoch，按 §3 实测的 0.19 s/iter 推算约 112 s/epoch，
+**100 epoch 约 3 小时**。这台机器驱动不稳（见 §3「队列与中断恢复」），别裸跑，用守护脚本：
+
+```powershell
+# 单跑 baseline15，崩了自动搬残档 + 重试，最多 3 次
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_train_guarded.ps1 `
+    -Name baseline15 -Data out/yolo_mvtec15/data.yaml
+
+# 或者一串挂上：补跑消融 -> baseline15 -> test 评测 -> 汇总表
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_overnight.ps1
 ```
 
 要记录的指标：
 
 | 指标 | 值 |
 | --- | --- |
-| 数据集规模（图 / 实例 / 类） | 待测 |
+| 数据集规模（图 / 实例 / 类） | train 4490 图 / 1261 实例，val 429 / 299，test 435 / 328，15 类（见上） |
 | box mAP50-95 / mAP50 | 待测 |
 | mask mAP50-95 / mAP50 | 待测 |
 | 单类 AP（15 类逐个） | 待测 |
@@ -121,14 +165,44 @@ focal 注入只能从这个入口开；它会把本次配置连同 focal 参数�
 | 编号 | 数据集 | focal | 想验证什么 | 结果 |
 | --- | --- | --- | --- | --- |
 | B0 | `out/yolo_bottle_tb` | 关 | 参照点 | mask mAP50-95 **0.2453** @ ep75（95/100 早停，15.7 min） |
-| B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | 待测 |
-| B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | 待测 |
+| B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | mask mAP50-95 **0.4071** @ ep81（跑满 100，16.8 min）；对 B0 **+0.1618**（+66%）。mask mAP50 0.4736→0.6824，box mAP50-95 0.2517→0.4554，mask P/R 0.9025/0.6032 |
+| B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | mask mAP50-95 **0.0039** @ ep27（31/100 早停，4.6 min）；mask P/R 0.0003/0.2778，box mAP50-95 0.0021，val 的 box/cls/dfl loss 全是 nan，彻底学崩。第一轮 02:56 被 nvlddmkm TDR 打死在 ep29（`_queue.log` 记为 exit=1），03:14 补跑时同名 run 目录被 ultralytics **原地覆盖**，第一轮残档已丢 —— 现在 `runs/logs/b2_focal.log` 和 `runs/segment/b2_focal/` 里全是补跑那轮的东西。补跑这轮完整跑完，所以“学崩”与驱动无关；覆盖这个坑见「队列与中断恢复」 |
 | B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 待测 |
-| B4 | `out/yolo_bottle_tb_nogood` | 关 | 关掉 good 背景负样本，量化它对误检率的抑制 | 待测 |
-| C1 | `out/yolo_bottle_tb_cp` | γ=2.0 α=0.25 | B1+B2 叠加：两个手段是否互补 | 待测 |
+| B4 | `out/yolo_bottle_tb_nogood` | 关 | 关掉 good 背景负样本，量化它对误检率的抑制 | mask mAP50-95 **0.0109** @ ep3（23/100 早停，1.5 min）；mask P/R 0.0833/0.0714，基本没学起来。**但这组不能直接归因给背景负样本，见下面 B4 的口径问题** |
+| C1 | `out/yolo_bottle_tb_cp` | γ=2.0 α=0.25 | B1+B2 叠加：两个手段是否互补 | mask mAP50-95 **0.1953** @ ep91（跑满 100，14.6 min）。比 B1 的 0.4071 **低 0.2118**，甚至低于 B0 基线 —— 在这个规模上 focal 是**负收益**，叠加也救不回来 |
 
 B1 vs B3 是这组里最有信息量的一对：如果"把旧图复制几遍"就能拿到和"合成新像素"
 差不多的收益，那 Copy-Paste 那套工程复杂度就不值得；反过来才说明合成管线有必要。
+
+### 本轮读出来的三件事
+
+**1. Copy-Paste 合成是真有效，而且幅度不小。** B1 对 B0：mask mAP50-95
+0.2453 → 0.4071（+0.1618，相对 +66%），mask mAP50 0.4736 → 0.6824，
+box mAP50-95 0.2517 → 0.4554。mask P 从 0.3885 跳到 0.9025 说明合成样本
+把"缺陷长什么样"的边界撑开了，误检明显下来；R 只到 0.6032，漏检仍是短板 ——
+和"缺陷样本本来就少"的直觉一致。
+
+**2. focal loss 在这个数据规模上是负收益，别默认它一定有用。**
+C1（Copy-Paste + focal）0.1953 比 B1（只有 Copy-Paste）0.4071 低了 0.2118，
+比不加任何增强的 B0 基线还低。γ=2 α=0.25 会把大量 easy negative 的梯度压掉，
+而这个子集 train 只有 335 图 / 97 实例，本来就没多少梯度可压，压完直接学不动。
+**教训：focal 是给"目标极多、正负样本比悬殊"的检测头设计的，
+小样本分割上先别开，要用也得从 γ=0.5~1.0 起扫。**
+
+**3. B4 这组本身口径有问题，结论先挂起。** 关掉 good 背景图之后
+train 只剩 **66 图 / 9 batch-iter**，23 epoch 早停 = 总共约 **207 次迭代**；
+而 B0 是 335 图 / 42 iter × 95 epoch ≈ **3990 次迭代**，差了 19 倍。
+所以 B4 的 0.0109 里混着"迭代步数根本不够"这个混杂因素，
+**不能直接说成"背景负样本贡献了 0.23 个 mAP"**。要重做就得把步数对齐：
+要么 `--epochs` 提到 ~600 让它跑够迭代，要么固定 `nbs` / 关掉 warmup 占比过高的前 3 轮。
+这一条留着，等 15 类全量基线出来再决定要不要补。
+
+### 数字怎么用
+
+上表的绝对值**一律不能写进简历**（原因见下面"读数警告"：val 只有 29 图 / 16 实例）。
+能写的是**相对关系和结论**：Copy-Paste 在这个 setup 下带来约 +66% 的相对提升、
+focal 在小样本上是负收益、以及"消融必须核对迭代步数是否可比"这个方法论教训。
+简历上要引绝对值，只能用 §2 的 15 类全量基线。
 
 ### 命令
 
@@ -185,10 +259,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_ablation_queue.ps1
 被中断的组不会留下 `train_args.json`，于是下次重跑自动重来 —— 这正是想要的：
 **消融宁可重跑，也不要拿一个截断的 run 去和跑满的 run 比**。
 
-这条不是纸上谈兵。2026-10-22 02:12:34 Windows Update 自动重启，B1 当时停在
-86/100（best@83，mask mAP50-95 0.3856）。因为 patience=20 且 best 在 83，它本该跑满
-100 epoch，这一组只能作废重跑；残留的 `results.csv` 与 `args.yaml` 已挪到
-`runs/_killed/b1_cp_ep86/` 留档（weights 226MB 丢弃，可复现）。
+这条不是纸上谈兵。2026-10-22 一晚连着中了两次，**根因不是 Windows Update，是显卡驱动 TDR**：
+
+| 时间 | 现象 | 证据 |
+| --- | --- | --- |
+| 02:12:34 | 整机蓝屏重启，B1 停在 86/100（best@83，mask mAP50-95 0.3856） | bugcheck `0x00000116` = VIDEO_TDR_FAILURE，可疑驱动 `nvlddmkm.sys`，转储 `C:\WINDOWS\Minidump\102226-14937-01.dmp`；事件日志 `Kernel-Power 41` + `WER 1001/1019` |
+| 02:55:40~02:56:11 | 系统没重启，B2 在 epoch 29 抛 `torch.AcceleratorError: CUDA error: unknown error` 退出 | `nvlddmkm` 事件 153/14 连报；崩前那一个 iter 卡了 **109.2 s**（正常 0.19 s），是驱动超时复位的典型形状 |
+
+第一次的残档已挪到 `runs/_killed/b1_cp_ep86/`（weights 226MB 丢弃，可复现）。
+第二次这种"进程死了、系统还活着"的情况更阴，日志里只有 CUDA 报错，
+得去翻事件查看器才知道是驱动 —— 所以排查训练崩溃时
+`Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'}` 要一起看。
+
+于是队列脚本加了**自动重试**（`-MaxAttempts`，默认 3）：单组非零退出且没落
+`train_args.json` 时，先把残档搬进 `runs/_killed/<name>_a<k>_ep<n>/`，
+探一次 `nvidia-smi` 确认驱动恢复了，再原地重跑；每次失败的日志单独存
+`<name>.attempt<k>.log`，不互相覆盖。单独跑一组用
+`tools/run_train_guarded.ps1 -Name <name> -Data <data.yaml>`，同一套逻辑。
+
+**这版重试还有个洞，10-22 当场踩到了。** `Quarantine` 原来只在“同一次调用内第 k 次
+重试之前”搬残档，`attempt=1` 之前不清场。于是上一次调用（甚至是加 Quarantine 之前的
+旧版脚本）留下的残档，会被下一次调用的 attempt=1 原地覆盖 —— b2_focal 第一轮 ep29
+的残档就是这么没的，事后只能靠 `_queue.log` 里那行 `exit=1` 证明它存在过。
+修法：每组在 `attempt=1` 开跑前先 `Quarantine <name> 0`，把遗留目录标成 `_a0_ep<n>`
+收进 `runs/_killed/`；同名残档已存在时叶节点再加 `HHmmss`，避免 `Move-Item -Force`
+把新残档塞进旧目录。`tools/run_ablation_queue.ps1` 已改。
+`tools/run_train_guarded.ps1` 当时正在跑 baseline15，没去动一个正在执行的文件，
+**等这轮结束再同步同一处修复**；在那之前如果要重挂 guarded，先手动把
+`runs/segment/<name>/` 挪进 `runs/_killed/`。
 
 想让它不随宿主 shell 一起被回收，用 WMI 建进程 —— 新进程的父级是 `WmiPrvSE.exe`，
 脱离了调用方的作业对象：
@@ -200,8 +298,10 @@ Invoke-CimMethod -ClassName Win32_Process -Method Create -Arguments @{
 }
 ```
 
-这能挡住 shell 回收，**挡不住系统重启**。跑长任务前先把 Windows「活动时间」
-设成覆盖训练时段，或者分批跑。
+这能挡住 shell 回收，**挡不住蓝屏**。这台机器上长任务的现实预期是
+"一定会被打断，靠守护脚本自己爬起来"，而不是"想办法不被打断"。
+要降低概率可以从两头下手：驱动侧（616.92 这个版本一晚 TDR 两次，可以试回滚或换 Studio 驱动）、
+负载侧（关 Wallpaper Engine 之类常驻吃 GPU 的进程，别把显存逼到上限）。
 
 ### 每组要记的数
 
