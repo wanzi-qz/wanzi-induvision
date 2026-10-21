@@ -70,6 +70,72 @@ jobs:
           PY
         shell: bash
 
+      # 缺陷合成冒烟：在上一步的转换产物上跑 copy-paste。
+      # 三次运行分别是「基准 / 同参数重跑 / 换并发度」，用来盯住可复现性与防泄漏。
+      - name: E2E smoke on defect synthesis
+        run: |
+          python tools/synthesize_defects.py --src ci-out/yolo_fake --out ci-out/synth_w1 --cap-factor 2 --workers 1 --figures 2
+          python tools/synthesize_defects.py --src ci-out/yolo_fake --out ci-out/synth_w1b --cap-factor 2 --workers 1 --figures 0
+          python tools/synthesize_defects.py --src ci-out/yolo_fake --out ci-out/synth_w4 --cap-factor 2 --workers 4 --figures 0 --link copy
+
+      - name: Assert synthesis artifacts
+        run: |
+          python - <<'PY'
+          import csv, json, pathlib
+          src = pathlib.Path("ci-out/yolo_fake")
+          a, b, c = (pathlib.Path(f"ci-out/synth_{t}") for t in ("w1", "w1b", "w4"))
+
+          def imgs(root, split):
+              d = root / "images" / split
+              return {p.name: p.read_bytes() for p in sorted(d.iterdir())} if d.is_dir() else {}
+
+          def report(root):
+              return json.loads((root / "synth_report.json").read_text(encoding="utf-8"))
+
+          def rows(root):
+              with (root / "synth_manifest.csv").open(encoding="utf-8", newline="") as fh:
+                  return list(csv.DictReader(fh))
+
+          for root in (a, b, c):
+              for name in ("data.yaml", "synth_manifest.csv", "synth_report.json", "defect_bank.npz"):
+                  assert (root / name).is_file(), f"missing {root / name}"
+
+          ra = report(a)
+          assert ra["bank"]["built_from"] == ["train"], ra["bank"]
+          assert ra["synth_images"] == len(rows(a)) > 0
+          for r in rows(a):
+              assert r["split"] == "train"
+              assert int(r["n_pasted"]) == int(r["polygons"]) >= 1, r
+          fid = ra["polygon_area_fidelity"]["mean"]
+          assert 0.5 < fid <= 1.3, f"polygon fidelity out of range: {fid}"
+          n_fig = len(list((a / "figures").glob("*.png")))
+          assert n_fig == 2, n_fig
+
+          for rep in (ra, report(b), report(c)):
+              assert all(v <= 0 for v in rep["remaining_quota"].values()), rep["remaining_quota"]
+              for k, v0 in rep["instances_before"].items():
+                  assert rep["instances_after"][k] >= v0, (k, v0, rep["instances_after"])
+
+          # 防泄漏：val/test 与源数据集逐字节一致，合成图只出现在 train
+          for split in ("val", "test"):
+              assert imgs(a, split) == imgs(src, split), f"{split} split was polluted"
+          extra = set(imgs(a, "train")) - set(imgs(src, "train"))
+          assert extra and extra == {r["out_name"] for r in rows(a)}, extra
+
+          # 跨进程可复现：同 seed + 同 workers -> 图像与 manifest 逐字节一致
+          assert imgs(a, "train") == imgs(b, "train"), "rerun is not bit-reproducible"
+          assert rows(a) == rows(b), "manifest differs between reruns"
+
+          # 并发度只影响「合成到第几张停」，不影响每张图的内容
+          shared = sorted(n for n in set(imgs(a, "train")) & set(imgs(c, "train")) if n.startswith("synth__"))
+          assert shared, "no shared synth images between workers=1 and workers=4"
+          ca, cc = imgs(a, "train"), imgs(c, "train")
+          assert all(ca[n] == cc[n] for n in shared), "same seed_child produced different pixels"
+          assert report(c)["synth_images"] >= ra["synth_images"]
+          print(f"ok: {ra['synth_images']} synth imgs, fidelity={fid}, shared={len(shared)}, "
+                f"instances {ra['instances_before']} -> {ra['instances_after']}")
+          PY
+        shell: bash
       - name: No dataset/weights leaked into repo
         run: |
           python - <<'PY'

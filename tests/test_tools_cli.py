@@ -95,3 +95,45 @@ def test_convert_cli_reports_missing_source(tmp_path: Path, capsys):
     rc = tool.main(["--src", str(tmp_path / "nope"), "--out", str(tmp_path / "y")])
     assert rc != 0
     assert "路径不存在" in capsys.readouterr().out
+
+# --------------------------------------------------------------------------
+# 训练入口：--dry-run 不导入 torch / ultralytics，CI 里也能守配置字典
+# --------------------------------------------------------------------------
+
+
+def _cfg_of(tool, data: Path, capsys, *extra) -> dict:
+    capsys.readouterr()
+    assert tool.main(["--data", str(data), "--dry-run", *extra]) == 0
+    out = capsys.readouterr().out
+    assert "[dry  ] 未训练" in out
+    return json.loads(out.split("[cfg  ]", 1)[1].splitlines()[0])
+
+
+def test_train_seg_dry_run_records_full_config(tmp_path: Path, capsys):
+    tool = _load_tool("train_seg")
+    data = tmp_path / "data.yaml"
+    data.write_text("names:\n  0: bottle\n", encoding="utf-8")
+    cfg = _cfg_of(tool, data, capsys, "--name", "w2_focal", "--focal-gamma", "2.0", "--epochs", "3")
+    assert cfg["data"] == str(data.resolve())
+    assert cfg["name"] == "w2_focal" and cfg["epochs"] == 3
+    assert cfg["focal_gamma"] == 2.0 and cfg["focal_alpha"] == 0.25
+    assert cfg["seed"] == 0 and cfg["amp"] is True and cfg["project"] is None
+    assert len(cfg["git_head"]) >= 7, "复现要靠 git_head，取不到就是环境问题"
+
+
+def test_train_seg_dry_run_flag_combinations(tmp_path: Path, capsys):
+    tool = _load_tool("train_seg")
+    data = tmp_path / "data.yaml"
+    data.write_text("names:\n  0: bottle\n", encoding="utf-8")
+
+    assert _cfg_of(tool, data, capsys, "--no-amp")["amp"] is False
+    off = _cfg_of(tool, data, capsys)  # focal 关闭时 alpha 不该混进配置
+    assert off["focal_gamma"] == 0.0 and off["focal_alpha"] is None
+    assert _cfg_of(tool, data, capsys, "--focal-gamma", "1.5", "--focal-alpha", "0.5")["focal_alpha"] == 0.5
+    assert _cfg_of(tool, data, capsys, "--project", "runs")["project"] == "runs"
+
+
+def test_train_seg_requires_data(tmp_path: Path):
+    tool = _load_tool("train_seg")
+    with pytest.raises(SystemExit):
+        tool.main(["--dry-run"])

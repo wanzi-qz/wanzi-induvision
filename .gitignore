@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# 调试草稿（临时探针/补丁脚本，不入库）
+_tmp_*
+
 # 权重与导出产物（体积大 + AGPL-3.0 许可，不入库）
 weights/
 *.pt

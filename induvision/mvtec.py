@@ -40,6 +40,7 @@ __all__ = [
     "scan_dataset",
     "build_splits",
     "mask_to_polygons",
+    "polygon_to_label_line",
     "convert_dataset",
 ]
 
@@ -366,6 +367,15 @@ def _polygon_to_yolo_line(cls_id: int, poly: np.ndarray, w: int, h: int) -> str:
     ys = np.clip(poly[:, 1].astype(np.float64) / max(h - 1, 1), 0.0, 1.0)
     coords = " ".join(f"{v:.6f}" for xy in zip(xs, ys) for v in xy)
     return f"{cls_id} {coords}"
+
+
+def polygon_to_label_line(cls_id: int, poly: np.ndarray, w: int, h: int) -> str:
+    """公开版归一化：像素多边形 -> 一行 YOLO-seg 标签。
+
+    单独暴露出来是为了让下游（缺陷合成、标签重写）复用**同一套**归一化口径，
+    不要各自写一份 `/w` 或 `/(w-1)`，否则同一条边界会差出半个像素。
+    """
+    return _polygon_to_yolo_line(cls_id, poly, w, h)
 
 
 # --------------------------------------------------------------------------- #

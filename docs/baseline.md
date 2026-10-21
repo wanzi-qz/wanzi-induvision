@@ -89,8 +89,9 @@ python tools/download_mvtec.py --source hf
 
 python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_mvtec15
 
-yolo segment train data=out/yolo_mvtec15/data.yaml model=weights/yolov8s-seg.pt `
-     imgsz=640 batch=8 epochs=100 patience=20 seed=0 name=baseline15
+python tools/train_seg.py --data out/yolo_mvtec15/data.yaml `
+     --model weights/yolov8s-seg.pt --name baseline15 --epochs 100
+# 默认就是 imgsz=640 / batch=8 / patience=20 / seed=0 / amp=True，不用逐个敲
 ```
 
 要记录的指标：
@@ -105,27 +106,92 @@ yolo segment train data=out/yolo_mvtec15/data.yaml model=weights/yolov8s-seg.pt 
 | 收敛 epoch / 总时长 | 待测 |
 | 峰值显存 / 迭代速度 | 待测 |
 
-## 3. W2 消融计划（待跑）
+## 3. W2 消融
 
-每个实验只动一个变量，其余全部固定（seed=0 / imgsz=640 / batch=8 / epochs=100 / patience=20）。
+协议：每个实验只动一个变量，其余全部固定
+（seed=0 / imgsz=640 / batch=8 / epochs=100 / patience=20 / AMP on / yolov8s-seg）。
 
-| 编号 | 变量 | 想验证什么 | 结果 |
-| --- | --- | --- | --- |
-| B0 | 基线（§2） | 参照点 | 待测 |
-| B1 | + Copy-Paste 缺陷合成增强 | 小样本合成对 recall 的提升 | 待测 |
-| B2 | + Focal Loss（cls 分支） | 难例加权的独立贡献 | 待测 |
-| B3 | + 过采样（缺陷图重复 2x / 3x） | 区分"合成新样本"与"重复旧样本"的差别 | 待测 |
-| B4 | 关闭 good 背景负样本（`--no-good-train`） | 量化背景负样本对误检率的抑制 | 待测 |
+统一走 `tools/train_seg.py`，不用裸 `yolo segment train`，两个原因：
+focal 注入只能从这个入口开；它会把本次配置连同 focal 参数和 git HEAD 写进
+`<run_dir>/train_args.json`，半年后还能对着复现。
 
-B1 vs B3 是这组里最有信息量的一对：如果重复采样就能拿到和合成差不多的收益，
-那 Copy-Paste 的工程复杂度就不值得；反过来才说明合成管线有必要。
+**编号口径以本表为准**，`docs/augmentation.md` 引用同一套（早前那篇把"两者叠加"
+写成 B3，已改为 C1，避免和这里的过采样组撞号）。
+
+| 编号 | 数据集 | focal | 想验证什么 | 结果 |
+| --- | --- | --- | --- | --- |
+| B0 | `out/yolo_bottle_tb` | 关 | 参照点 | 待测 |
+| B1 | `out/yolo_bottle_tb_cp` | 关 | Copy-Paste 合成对 recall 与少数类 AP 的提升 | 待测 |
+| B2 | `out/yolo_bottle_tb` | γ=2.0 α=0.25 | 难例加权的独立贡献 | 待测 |
+| B3 | `out/yolo_bottle_tb_os` | 关 | 过采样（稀有类原图整张复制） | 待测 |
+| B4 | `out/yolo_bottle_tb_nogood` | 关 | 关掉 good 背景负样本，量化它对误检率的抑制 | 待测 |
+| C1 | `out/yolo_bottle_tb_cp` | γ=2.0 α=0.25 | B1+B2 叠加：两个手段是否互补 | 待测 |
+
+B1 vs B3 是这组里最有信息量的一对：如果"把旧图复制几遍"就能拿到和"合成新像素"
+差不多的收益，那 Copy-Paste 那套工程复杂度就不值得；反过来才说明合成管线有必要。
+
+### 命令
+
+```powershell
+conda activate induvision
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv   # 上卡前必看，8GB 一次只跑一个
+
+# 单变量组 + 复合组
+python tools/train_seg.py --data out/yolo_bottle_tb/data.yaml    --model weights/yolov8s-seg.pt --name b0_base     --epochs 100
+python tools/train_seg.py --data out/yolo_bottle_tb_cp/data.yaml --model weights/yolov8s-seg.pt --name b1_cp       --epochs 100
+python tools/train_seg.py --data out/yolo_bottle_tb/data.yaml    --model weights/yolov8s-seg.pt --name b2_focal    --focal-gamma 2.0 --focal-alpha 0.25 --epochs 100
+python tools/train_seg.py --data out/yolo_bottle_tb_cp/data.yaml --model weights/yolov8s-seg.pt --name c1_cp_focal --focal-gamma 2.0 --focal-alpha 0.25 --epochs 100
+
+# B4：重跑一遍转换，关掉 good 背景图
+python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_bottle_tb_nogood --no-good-train
+python tools/train_seg.py --data out/yolo_bottle_tb_nogood/data.yaml --model weights/yolov8s-seg.pt --name b4_nogood --epochs 100
+```
+
+B3 还差一个落盘 CLI：配额函数 `balance.plan_oversample()` 已经写好也有单测，
+但没有对应的 `tools/` 入口把它变成数据集目录，所以 B3 目前是**待实现**状态，不排进本轮。
+
+B4 要留意一点：`--no-good-train` 只动 train，val / test 里的 good 背景图照旧保留，
+所以它和 B0 的评测集是同一批图 —— 这才是干净的单变量对比，误检率的差异才归因得到这一个开关上。
+
+### 汇总与协议自检
+
+跑完别手抄数字，用 `tools/summarize_ablation.py`：
+
+```powershell
+python tools/summarize_ablation.py --markdown    # 直接贴进上面那张表的"结果"列
+python tools/summarize_ablation.py --strict      # 各组 seed/imgsz/batch/epochs/patience/amp 不一致就非零退出
+```
+
+它从 `results.csv` 取 best epoch（默认按 mask mAP50-95），并回读每组的训练配置做一致性检查。
+加 `--strict` 的意义在于：**消融最怕的不是指标难看，是"以为是单变量对比、其实 batch 都不一样"**，
+这种事靠记忆一定出错，交给脚本查。
+
+### 每组要记的数
+
+box / mask 各自的 P、R、mAP50、mAP50-95，两个类分别的 AP，收敛 epoch，
+总时长，峰值显存。来源：`runs/segment/<name>/results.csv` + 训练末尾的指标摘要。
+
+### 读数警告（重要）
+
+这一轮用的是 bottle + toothbrush 两类子集，**val 只有 29 图 / 16 实例**：
+漏检 1 个实例 recall 直接掉 6.25 个点。所以这组消融**只能读趋势和相对差**，
+绝对值不能写简历；能写进简历的数必须来自 §2 的 15 类全量基线。
 
 ## 4. 复现注意事项
 
 1. **AMP 自检资产**：ultralytics 首次训练会联网下 `yolo26n.pt` 做 AMP 检查，
-   它只在**运行命令的工作目录**（仓库根）找这个文件。提前放好，或临时 `amp=False`。
+   它只在**运行命令的工作目录**（仓库根）找这个文件。仓库根已经放了一份（5.5 MB，
+   不入库，`*.pt` 被 `.gitignore` 排除），克隆下来要自己补，或临时 `--no-amp`。
+   AMP 开着时 yolov8s-seg @ batch 8 / 640 实测只吃 2.3~3.0 GiB，比 §1 关 AMP 的
+   4.34 GiB 省一半，8GB 卡上余量很足。
 2. **不要用 `pip install torch` 升级 induvision 环境**：PyPI 默认 CPU 版，
    会把 cu130 覆盖掉，`cuda.is_available()` 立刻变 False。
 3. **`runs/` 不入库**。要留档的曲线图、混淆矩阵截图复制到 `docs/figures/` 再提交。
 4. **别和别的 GPU 任务同时跑**：8GB 显存下两个训练任务会互相拖慢并有 OOM 风险，
-   本次冒烟就是这么中断的。
+   §1 的冒烟就是这么中断的。上卡前先
+   `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`
+   确认没有别人的 python 进程。
+5. **`--model` 要写全路径** `weights/yolov8s-seg.pt`。默认值是裸文件名 `yolov8s-seg.pt`，
+   仓库根没有这个文件，ultralytics 会转头去联网下载，国内网络下会卡很久。
+6. **`runs/segment/<name>/results.csv` 是唯一可信的指标来源**。控制台进度条会被
+   `\r` 刷屏，日志里想按 epoch 取数得先过滤；直接读 csv 省事。

@@ -17,21 +17,31 @@
 | W0 | GPU 环境搭建 + 自检脚本（版本/GPU/推理/ONNX 导出） | 完成 → [docs/environment.md](docs/environment.md) |
 | W1a | MVTec 下载校验 + YOLO-seg 转换管线 + 单测 + CI | 完成 → [docs/dataset.md](docs/dataset.md) |
 | W1b | 15 类全量数据 + 基线训练（mAP50-95、单类 AP、混淆矩阵） | 进行中 → [docs/baseline.md](docs/baseline.md) |
-| W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 未开始 |
+| W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 代码与测试完成 → [docs/augmentation.md](docs/augmentation.md)；消融训练待填数 |
 | W3 | ONNX 导出 + trtexec FP32/FP16/INT8（熵校准，500 张校准集） | 未开始（工具链待装） |
 | W4 | TensorRT C++ 推理服务：零拷贝 + 三线程流水线 + CMake + 压测报告 | 未开始（工具链待装） |
 
 ## 仓库结构
 
 ```
-induvision/          核心库：目录扫描、分层划分、掩码→多边形、落盘与统计
+induvision/          核心库（只依赖 numpy / opencv / pyyaml，CI 能全量跑）
+  mvtec.py               MVTec 目录扫描 + 分层划分 + 掩码→多边形
+  yolo_dataset.py        读写本仓库产出的 YOLO-seg 数据集
+  defect_bank.py         缺陷实例库：只从 train 划分抠缺陷，从源头杜绝 val/test 泄漏
+  copy_paste.py          Copy-Paste 贴图与融合（poisson / alpha），标签同步重建
+  balance.py             类别不均衡诊断 + 合成配额规划
+  focal.py               Focal Loss：给 ultralytics 分类分支换损失，可装可卸（LIFO）
 tools/
   env_check.py           环境与推理链路自检（可选 --export 验 ONNX 导出）
   download_mvtec.py      取数据：官方 zip 手动模式 / HF 镜像自动模式，逐文件 sha256
   convert_mvtec_to_yolo.py   MVTec AD → YOLOv8-seg 数据集
+  synthesize_defects.py  Copy-Paste 缺陷合成，给已有数据集补齐少数类实例配额
+  train_seg.py           训练入口：统一 CLI + 可选 focal 注入 + 配置留档 + 指标摘要
+  summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，并校验「单变量协议」有没有跑歪
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
-tests/               36 条 pytest，纯 CPU、不联网、不需要真实数据集
-docs/                environment.md 环境 / dataset.md 数据与协议 / baseline.md 训练结果
+tests/               193 条 pytest，纯 CPU、不联网、不需要真实数据集
+docs/                environment.md 环境 / dataset.md 数据与协议
+                     baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
 requirements-gpu.txt 本地 GPU 环境（钉版本）
 requirements-ci.txt  CI 最小依赖（刻意不含 torch）
 data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"
@@ -49,17 +59,31 @@ python tools/download_mvtec.py --source hf --categories bottle toothbrush
 # 2) 转成 YOLO-seg（默认硬链接落盘，同盘不额外占空间）
 python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_mvtec
 
-# 3) 训练。8GB 显存：s 型号 + imgsz 640 + batch 8 起步
-yolo segment train data=out/yolo_mvtec/data.yaml model=weights/yolov8s-seg.pt `
-     imgsz=640 batch=8 epochs=100 patience=20 name=baseline
-# 产物落在 runs/segment/baseline。别传 project=runs，会拼成 runs/segment/runs/baseline
+# 3) 训练。统一走 train_seg.py：配置留档、可选 focal 注入、跑完打指标摘要
+python tools/train_seg.py --data out/yolo_mvtec/data.yaml `
+     --model weights/yolov8s-seg.pt --name baseline --epochs 100
+# 8GB 显存起步参数就是默认的 imgsz 640 / batch 8 / AMP on（实测 2.3~3.0 GiB）
+# 产物落在 runs/segment/baseline。别传 --project runs，会拼成 runs/segment/runs/baseline
 
-# 4) 单测（36 条 / 约 4 秒）
+# 3b) 小样本 + 类别不均衡：先合成缺陷补齐少数类，再训练
+python tools/synthesize_defects.py --src out/yolo_mvtec --out out/yolo_mvtec_cp `
+     --cap-factor 2.0 --seed 0 --workers 4
+python tools/train_seg.py --data out/yolo_mvtec_cp/data.yaml `
+     --model weights/yolov8s-seg.pt --name cp_focal `
+     --focal-gamma 2.0 --focal-alpha 0.25 --epochs 100
+# 合成只加 train，val/test 逐字节不动；细节和防泄漏口径见 docs/augmentation.md
+
+# 4) 消融跑完汇总成表，顺带校验各组超参真的一致
+python tools/summarize_ablation.py --markdown          # 可直接贴进 docs/baseline.md
+python tools/summarize_ablation.py --strict            # 协议不一致就返回非零
+
+# 5) 单测（193 条，装 torch 约 18 秒；没装 torch 会自动跳 2 条真模型用例）
 python -m pytest -q
 ```
 
-不装 GPU 环境也能跑通 2 和 4：转换管线只依赖 numpy / opencv / pyyaml。
-CI 就是这么验的（ubuntu + windows × py3.10/3.12）。
+不装 GPU 环境也能跑通 2、3b 和 4：转换与合成管线只依赖 numpy / opencv / pyyaml。
+CI 就是这么验的（ubuntu + windows × py3.10/3.12），并且在 CI 里端到端跑了一遍
+缺陷合成，逐字节断言 val/test 没被改动。
 
 ## 三个关键设计决策
 
@@ -99,7 +123,20 @@ bottle + toothbrush 冒烟集（487 文件 / 254 MB，2026-10-21）：
 这两行数字直接指出了 W2 要解决什么：**缺陷样本稀缺（23.6%）+ 目标极小（p50 3.5%）**，
 对应 Copy-Paste 缺陷合成和 Focal Loss / 过采样。
 
-训练结果（含 15 类全量基线）见 [docs/baseline.md](docs/baseline.md)。
+W2 合成管线实测（bottle + toothbrush，seed=0 / cap-factor=2 / workers=4）：
+
+| 项 | 值 |
+| --- | --- |
+| 缺陷库 | 97 实例 / 66 图，`built_from=["train"]` |
+| 合成产出 | 40 张新图 / 109 个实例，配额打满，耗时 13.8 s |
+| 实例均衡 | bottle 50 → 101，toothbrush 47 → 105 |
+| 标签面积保真度 | mean 0.9675，p10 0.9215，min 0.8154 |
+| 划分变化 | train 335 → 375，val 29 / test 30 **零改动**（CI 逐字节断言） |
+| 测试规模 | 36 → **193** 条 pytest（W2 新增 157 条） |
+
+完整参数表、拒绝采样统计与两个 focal 踩坑记录见
+[docs/augmentation.md](docs/augmentation.md)。
+训练结果（含 15 类全量基线与消融）见 [docs/baseline.md](docs/baseline.md)。
 
 ## 许可与入库边界
 
