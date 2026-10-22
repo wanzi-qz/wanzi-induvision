@@ -186,7 +186,9 @@ jobs:
           bad = [f for f in tracked if f.startswith(("data/", "weights/", "out/", "runs/"))
                  and not f.endswith(("data/README.md",))]
           bad += [f for f in tracked if f.endswith((".pt", ".onnx", ".engine", ".trt"))]
+          # 压测与排查过程中的草稿脚本/中间产物一律不入库（W4① 一轮就产生了 27 个 _tmp*）
+          bad += [f for f in tracked if f.startswith("_tmp") or "/_tmp" in f]
           assert not bad, f"forbidden files tracked: {bad}"
-          print(f"ok: {len(tracked)} tracked files, no dataset/weights/artifacts")
+          print(f"ok: {len(tracked)} tracked files, no dataset/weights/artifacts/scratch")
           PY
         shell: bash
