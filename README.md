@@ -65,7 +65,8 @@ docs/                overview.md 项目说明（背景 / 方法 / 结果，先�
                      environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
                      deploy.md 部署链路（ONNX 导出、三层精度对齐与固定抽样口径）
-                     pipeline.md 推理流水线（pinned 令牌池 / 三线程 / 与串行结果对拍）
+                     pipeline.md 推理流水线（pinned 令牌池 / 三线程 / 与串行结果对拍 / 500 帧延迟与资源占用）
+                     cpp_infer.md W4② C++ 版施工单（本机工具链缺口实测 / 安装清单 / 验收判据）
 requirements-gpu.txt 本地 GPU 环境（钉版本）
 requirements-ci.txt  CI 最小依赖（刻意不含 torch）
 data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"

@@ -681,6 +681,8 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
 
 先说本机缺什么（实测，不是猜）：`nvcc` / `cmake` / `cl` / `ninja` / `msbuild` 全部 not found，
 无 CUDA Toolkit、无 VS 安装目录。要装 VS Build Tools（含 C++ 工作负载）+ CUDA Toolkit，数 GB。
+**逐样东西怎么装、TensorRT 的头与 `.lib` 从哪来（pip wheel 里 0 个 `.lib`）、装完按什么顺序做、
+拿什么判据验收，全部写在 [cpp_infer.md](cpp_infer.md)** —— 本节只留方向。
 
 工具链到位后要做的：
 

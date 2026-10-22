@@ -123,14 +123,18 @@ verdict **pass**。原计划用 `trtexec`，但本机根本没有 `trtexec.exe` 
 
 **① Python 侧流水线：已完成**（`induvision/pipeline.py` + `pinned.py`，入口 `tools/bench_pipeline.py`）。
 pinned memory 零拷贝 + 异步 H2D/D2H、解码 / 推理 / 后处理三线程流水线 + 自研环形队列、
-NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清单 × 10 轮 = 300 帧量吞吐。
+NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清单 × 10 轮 = 300 帧量吞吐，
+另一份 50 张 × 10 轮 = 500 帧量**端到端延迟与 CPU/GPU 占用**（§3.3c 末尾）。
 含磁盘读图的真实口径 **1.44~1.71×**，隔离磁盘后 **1.19~1.42×**、INT8 档 **330 FPS**；
 与 ultralytics 对拍 match_rate 1.0000 / 框 IoU 1.0000 / 掩码 IoU 0.910~0.916，三档 10 条判据全过。
 细节、掩码解码那个 bug 的完整排查、以及「util ≈0.99 不等于算力打满」这个读数陷阱见 [pipeline.md](pipeline.md)。
 
-**② C++ 版：待做**。TensorRT C++ API（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 → 后处理）
-+ CMake 工程 + 500 张端到端 P50/P95 压测。本机实测 `nvcc` / `cmake` / `cl` / `ninja` / `msbuild`
-全部 not found，也没有 CUDA Toolkit 与 VS 安装目录，得先装 VS Build Tools + CUDA Toolkit（数 GB）。
+**② C++ 版：待做，且被本机工具链硬卡住**。TensorRT C++ API（engine 反序列化 → CUDA 流 →
+`cudaWarpAffine` 前处理 → 推理 → 后处理）+ CMake 工程 + 500 帧端到端压测（P50/P95 已在 ① 的 Python 侧
+量出来了，C++ 版要补的是 **P99** 与 `wait`/`busy` 拆分）。本机实测 `nvcc` / `cmake` / `cl` / `ninja` /
+`msbuild` 全部 not found，也没有 CUDA Toolkit 与 VS 安装目录；连 TensorRT 的**头文件和 import lib 都没有**
+（pip wheel 里 11 个 DLL、0 个 `.lib`）—— MSVC 链接期过不去，这一条比装编译器更卡人。
+逐样怎么装、`.lib` 从哪来、装完按什么顺序做、拿什么判据验收，写在 [cpp_infer.md](cpp_infer.md)。
 ①的实测把 ② 的方向钉住了：含磁盘那轮的瓶颈是 **16~19 ms 的 CPU 前处理**（GPU 已能完全藏进去），
 所以 C++ 版真正要搬上 GPU 的是 letterbox，不是 NMS。
 
