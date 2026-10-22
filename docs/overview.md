@@ -168,9 +168,19 @@ providers 里没有 CUDAExecutionProvider。这组数字是留给 W3b 三档量�
 | 项 | 值 |
 | --- | --- |
 | 单测 | **391 条 pytest**，纯 CPU、不联网、不需要真实数据集，base 环境 17.6 s |
-| CI | ubuntu + windows × py3.10/3.12 共 4 job |
+| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 只收 373 条（368 passed / 5 skipped），比本地少 24 条 —— `tests/test_focal.py` 模块级 `importorskip("torch")`，CI 刻意不装 torch，整文件跳过 |
 | 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 | 入库边界 | CI 断言守着：`git ls-files` 出现 `data/`、`weights/`、`out/`、`runs/` 或任何 `.pt/.onnx/.engine/.trt` 就失败 |
+
+顺带记一条跨平台坑，因为它把 ubuntu job 连着挂了 7 个提交才被发现：
+`tools/summarize_ablation.py` 的 `dataset_name()` 原先用 `Path()` 直读 `args.yaml` 里的 `data`，
+而那条路径是 Windows 训练写下的反斜杠串；POSIX 上 `Path` 不把 `\` 当分隔符，
+整条路径被当成一个文件名，`parent.name` 于是返回空串。修法是先把 `\` 换成 `/` 再解析，
+函数返回值从此不随运行平台变化，四个平台组合同一套期望值。
+
+同期给 CI 的 `Unit tests` 步骤加了一件事：pytest 挂掉时把短摘要、失败块名、`E` 断言行
+写成 workflow annotation。原因是 actions 的日志下载要鉴权（本地没有 token 直接 403），
+而 annotation 走公开 API 就能读 —— 上面那条反斜杠的 bug 就是这么定位的，不用去点网页。
 
 ---
 
