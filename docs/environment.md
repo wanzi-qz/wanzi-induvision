@@ -74,6 +74,10 @@ W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py
 | ONNX 输出 | `output0: [batch, 116, anchors]`、`output1: [batch, 32, mask_height, mask_width]` |
 | onnx.checker | 通过 |
 
+> 这里的 **116 = 4（box）+ 80（COCO 类）+ 32（mask 系数）**，因为自检用的是 COCO 预训练权重。
+> 本项目 15 类的 baseline15 导出后同一位置是 **51 = 4 + 15 + 32**，两个数不要互相印证，
+> 见 [deploy.md](deploy.md) §3。
+
 模型规模：YOLOv8s-seg 85 层、11,810,560 参数、40.1 GFLOPs。
 
 tie / donut 是 COCO 预训练权重对这张图的误检，属正常现象，只用于验证推理链路能跑通。
@@ -88,19 +92,24 @@ W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py --export   # �
 W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py --image 自己的图.jpg
 ```
 
-## 6. 还没装的东西（W3/W4 才需要）
+## 6. 还没装的东西（W3b/W4 才需要）
 
 | 工具 | 用途 | 阶段 |
 | --- | --- | --- |
 | CUDA Toolkit 12.x/13.x（nvcc） | 编译 C++/CUDA 扩展 | W4 |
 | cuDNN | 已随 torch 自带（92000），单独装仅为 C++ 工程链接用 | W4 |
-| TensorRT 10.x（Windows zip 版） | FP16/INT8 量化、trtexec | W3 |
+| TensorRT 10.x（Windows zip 版） | FP16/INT8 量化、trtexec | W3b |
 | Visual Studio Build Tools（C++ 工作负载） | cl.exe 编译器 | W4 |
 | CMake | 组织 C++ 工程 | W4 |
 
-onnxruntime 目前装的是 **CPU 版**。刻意不装 onnxruntime-gpu：GPU 推理这条路最终由
+ONNX 三件套（onnx 1.23.2 / onnxruntime 1.31.0 / onnxslim 0.1.98）**已装好并在 W3a 用上**：
+导出与三层精度对齐的实测见 [deploy.md](deploy.md)。
+
+onnxruntime 装的是 **CPU 版**。刻意不装 onnxruntime-gpu：GPU 推理这条路最终由
 TensorRT 承担，再装一份 onnxruntime-gpu 会带来 CUDA/cuDNN DLL 版本冲突，收益为零。
 ONNX 在本项目里的角色是"导出中间格式 + 数值对齐校验"，CPU 足够。
+副作用要记着：`verify_onnx.py` 第 3 层量到的 ORT 延迟是 **CPU 延迟**（providers 里没有
+CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 PyTorch 比后端优劣。
 
 ## 7. 已知注意事项
 
