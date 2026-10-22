@@ -115,6 +115,10 @@ def test_read_config_missing(tmp_path):
 
 # ------------------------------------------------- dataset_name / focal_str
 
+# 这四条必须在 Linux 和 Windows 上给出同一个答案：args.yaml 里的 data 路径
+# 是哪台机器训练留下的就长哪台的样子。第二条（反斜杠）是 ubuntu CI 挂过的回归位 ——
+# 当时 dataset_name 直接用 Path() 解析，POSIX 不认反斜杠，整条路径被当成一个文件名，
+# parent.name 返回空串。别把它改回 Path() 直读。
 @pytest.mark.parametrize("data,expected", [
     ("/x/out/yolo_bottle_tb/data.yaml", "yolo_bottle_tb"),
     (r"C:\a\out\ds\data.yml", "ds"),

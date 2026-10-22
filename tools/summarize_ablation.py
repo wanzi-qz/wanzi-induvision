@@ -31,7 +31,7 @@ import csv
 import json
 import sys
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,7 +100,12 @@ def dataset_name(cfg: Dict[str, object]) -> str:
     d = str(cfg.get("data") or "")
     if not d:
         return "?"
-    p = Path(d)
+    # args.yaml 里的 data 路径是「哪台机器写的就长什么样」：Windows 训练留下反斜杠，
+    # Linux 留下正斜杠。而 Path() 在 POSIX 上不把反斜杠当分隔符，会把整条路径当成
+    # 一个文件名，parent.name 就成了空串 —— ubuntu 的 CI job 正是这么挂的
+    # （test_dataset_name[r"C:\a\out\ds\data.yml"] 拿到 "" 而不是 "ds"）。
+    # 统一先把反斜杠换成正斜杠再解析，这个函数的返回值才不随运行平台变化。
+    p = PurePath(d.replace("\\", "/"))
     return p.parent.name if p.name.endswith((".yaml", ".yml")) else p.name
 
 
