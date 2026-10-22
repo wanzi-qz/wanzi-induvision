@@ -47,6 +47,7 @@ W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py
 | onnx | 1.23.2 |
 | onnxruntime | 1.31.0（CPU 版，见 §6） |
 | onnxslim | 0.1.98 |
+| tensorrt-cu13 | 10.16.1.11（含 `_bindings` / `_libs` 同版，W3b 装，见 §6） |
 | numpy | 2.5.2 |
 | opencv-python | 5.0.0.93 |
 | scikit-image | 0.26.0 |
@@ -92,15 +93,33 @@ W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py --export   # �
 W:\Anaconda\envs\induvision\python.exe -X utf8 tools\env_check.py --image 自己的图.jpg
 ```
 
-## 6. 还没装的东西（W3b/W4 才需要）
+## 6. W3b 装了什么，以及还没装的东西（W4 才需要）
 
-| 工具 | 用途 | 阶段 |
+TensorRT 走的是 **pip wheel**，不是官网的 Windows zip 包：
+
+```powershell
+W:\Anaconda\envs\induvision\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple tensorrt-cu13
+```
+
+装完是三个包：`tensorrt_cu13` / `tensorrt_cu13_bindings` / `tensorrt_cu13_libs`，均 10.16.1.11。
+选 cu13 而不是 cu12 是因为本环境 torch 是 `2.13.0+cu130`，CUDA 大版本要对上。
+
+这个装法有一个直接后果，写在前面免得后面反复解释：
+
+> **wheel 里没有 `trtexec.exe`，只有 DLL。** 所以本项目的 engine 构建与压测
+> 全部走 TensorRT **Python API**（`tools/build_trt.py` 与 `tools/bench_trt.py`）：
+> 自己建 Builder / Network / OnnxParser / OptimizationProfile，自己写
+> `IInt8Calibrator` 子类喂真实图，自己从 engine 的 inspector 里报层格式直方图。
+> 比调 trtexec 麻烦，但每一步都能拿到中间量，而且 W4 的 C++ 推理服务本来就要自己写这些。
+
+| 工具 | 状态 | 用途 / 阶段 |
 | --- | --- | --- |
-| CUDA Toolkit 12.x/13.x（nvcc） | 编译 C++/CUDA 扩展 | W4 |
-| cuDNN | 已随 torch 自带（92000），单独装仅为 C++ 工程链接用 | W4 |
-| TensorRT 10.x（Windows zip 版） | FP16/INT8 量化、trtexec | W3b |
-| Visual Studio Build Tools（C++ 工作负载） | cl.exe 编译器 | W4 |
-| CMake | 组织 C++ 工程 | W4 |
+| TensorRT 10.16.1.11 | **已装**（pip wheel） | FP32/FP16/INT8 三档构建与压测，W3b；实测见 [deploy.md](deploy.md) §8 |
+| trtexec.exe | 未装（wheel 不带） | 不需要；对照数据用 ultralytics 自带导出交叉验证过，见 deploy.md §8.8 |
+| CUDA Toolkit 12.x/13.x（nvcc） | 未装 | 编译 C++/CUDA 扩展，W4 |
+| cuDNN | 已随 torch 自带（92000） | 单独装仅为 C++ 工程链接用，W4 |
+| Visual Studio Build Tools（C++ 工作负载） | 未装 | cl.exe 编译器，W4 |
+| CMake | 未装 | 组织 C++ 工程，W4 |
 
 ONNX 三件套（onnx 1.23.2 / onnxruntime 1.31.0 / onnxslim 0.1.98）**已装好并在 W3a 用上**：
 导出与三层精度对齐的实测见 [deploy.md](deploy.md)。

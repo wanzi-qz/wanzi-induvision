@@ -16,4 +16,10 @@ ultralytics-thop==2.2.3
 onnx==1.23.2
 onnxruntime==1.31.0
 onnxslim==0.1.98
+# W3b：TensorRT 走 pip wheel（不是官网 zip），装完自带 _bindings/_libs 两个同版包。
+# 选 cu13 是因为本环境 torch 是 cu130，CUDA 大版本要对上。wheel 里没有 trtexec.exe，
+# 所以构建与压测全走 Python API（tools/build_trt.py、tools/bench_trt.py），见 docs/environment.md §6。
+tensorrt-cu13==10.16.1.11
+tensorrt-cu13-bindings==10.16.1.11
+tensorrt-cu13-libs==10.16.1.11
 pytest==9.1.1
