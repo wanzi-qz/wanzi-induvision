@@ -62,6 +62,7 @@ from induvision.pipeline import (  # noqa: E402
     run_serial,
     speedup_report,
 )
+from induvision.prof import ResourceSampler  # noqa: E402
 from induvision.trt_infer import TrtRunner  # noqa: E402
 import verify_onnx as vox  # noqa: E402 - 复用抽样口径，保证与 W3b 报告同一批图
 
@@ -405,6 +406,31 @@ def _md(rep: Dict[str, Any], cfg: Dict[str, Any]) -> List[str]:
                 L.append(f"| {mode} | {kind} | {_f(r['wall_s'])} | {_f(r['throughput_fps'])} "
                          f"| {sp} | {cell[0]} | {cell[1]} | {cell[2]} |")
         L.append("")
+        L.append("| 缓冲 | 模式 | 端到端 P50 ms | P95 ms | P99 ms | max ms |")
+        L.append("|---|---|---|---|---|---|")
+        for mode in present:
+            for kind in ("serial", "pipeline"):
+                e = (t["modes"][f"{mode}_{kind}"].get("e2e_latency") or {})
+                L.append(f"| {mode} | {kind} | {_f(e.get('p50_ms'))} | {_f(e.get('p95_ms'))} "
+                         f"| {_f(e.get('p99_ms'))} | {_f(e.get('max_ms'))} |")
+        L.append("")
+        L.append("> 端到端延迟含排队等待，所以流水线的 P50 比串行大是**正常的**："
+                 "流水线拿单帧延迟换吞吐。这两个数必须一起报，只报 FPS 会掩盖延迟恶化。")
+        L.append("")
+        rz_rows = [(k, v.get("resources")) for k, v in t["modes"].items() if v.get("resources")]
+        if rz_rows:
+            L.append("| 组合 | CPU 核当量 均值/峰值 | GPU util 均值/峰值 % | 显存 MiB | 采样点 |")
+            L.append("|---|---|---|---|---|")
+            for k, rz in rz_rows:
+                L.append(f"| {k} | {_f(rz.get('cpu_cores_mean'))} / {_f(rz.get('cpu_cores_max'))} "
+                         f"| {_f(rz.get('gpu_util_mean_pct'), '.1f')} / "
+                         f"{_f(rz.get('gpu_util_max_pct'), '.1f')} "
+                         f"| {_f(rz.get('gpu_mem_used_max_mib'), '.0f')} "
+                         f"| {rz.get('gpu_samples')} |")
+            L.append("")
+            L.append(f"> 资源采样间隔 {rz_rows[0][1].get('interval_s')} s。"
+                     "**这一组不能和没开采样的那轮混着比 FPS** —— nvidia-smi 子进程自己也吃 CPU。")
+            L.append("")
         pg = t.get("pinned_gain") or {}
         L.append(f"- pinned vs plain：串行 {_f(pg.get('serial'), '.3f')}x，"
                  f"流水线 {_f(pg.get('pipeline'), '.3f')}x（同口径 FPS 之比）")
@@ -485,6 +511,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--min-match-rate", type=float, default=DEFAULT_MIN_MATCH_RATE)
     ap.add_argument("--min-box-iou", type=float, default=DEFAULT_MIN_BOX_IOU)
     ap.add_argument("--min-mask-iou", type=float, default=DEFAULT_MIN_MASK_IOU)
+    ap.add_argument("--sample-resources", action="store_true",
+                    help="采样 CPU 核数当量与 GPU 利用率/显存（默认关：nvidia-smi 子进程本身会扰动被测对象）")
+    ap.add_argument("--sample-interval", type=float, default=0.2,
+                    help="资源采样间隔秒，仅在 --sample-resources 时生效")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--markdown", action="store_true", help="同时落一份 .md")
     ap.add_argument("--dry-run", action="store_true")
@@ -531,6 +561,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "pool_size": args.pool_size, "join_timeout": args.join_timeout,
         "need_masks": not args.no_masks, "modes": list(args.modes),
         "check_ultralytics": bool(args.check_ultralytics),
+        "sample_resources": bool(args.sample_resources),
+        "sample_interval_s": args.sample_interval,
         "sample_list": str(sample_list) if sample_list else None,
         "weights": str(w), "json_out": str(json_out), **th, **th_gate,
     }
@@ -539,6 +571,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for t, p in engines.items():
             print(f"[dry  ] {t}: {p}（{round(p.stat().st_size / 1024**2, 2)} MiB）")
         print(f"[dry  ] 每档 {len(args.modes)} 种缓冲 x 2 种模式 x {n_items} 帧")
+        print(f"[dry  ] 资源采样={'开 @ ' + str(args.sample_interval) + ' s' if args.sample_resources else '关'}")
         return 0
 
     try:
@@ -612,17 +645,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 gc.collect()
                 torch.cuda.empty_cache()
                 t0 = time.perf_counter()
-                if kind == "serial":
-                    results, rep = run_serial(frames, stages)
-                else:
-                    results, rep = Pipeline(stages, capacity=args.capacity,
-                                            join_timeout=args.join_timeout).run(frames)
+                sampler = ResourceSampler(interval_s=args.sample_interval) \
+                    if args.sample_resources else None
+                if sampler is not None:
+                    sampler.start()
+                try:
+                    if kind == "serial":
+                        results, rep = run_serial(frames, stages)
+                    else:
+                        results, rep = Pipeline(stages, capacity=args.capacity,
+                                                join_timeout=args.join_timeout).run(frames)
+                finally:
+                    if sampler is not None:
+                        rep_res = sampler.stop()
                 rep["elapsed_incl_overhead_s"] = round(time.perf_counter() - t0, 4)
+                if sampler is not None:
+                    rep["resources"] = rep_res
                 rep["checksum"] = checksum(results)
                 rep["order_ok"] = order_ok(frames, results)
                 modes[key] = rep
+                e2e = rep.get("e2e_latency") or {}
                 print(f"[run  ] {key}: wall {rep['wall_s']} s, fps {rep['throughput_fps']}, "
-                      f"dets {rep['checksum']['dets']}, 保序 {rep['order_ok']}")
+                      f"dets {rep['checksum']['dets']}, 保序 {rep['order_ok']}, "
+                      f"e2e P50 {_f(e2e.get('p50_ms'))} / P95 {_f(e2e.get('p95_ms'))} ms")
+                if rep.get("resources"):
+                    rz = rep["resources"]
+                    print(f"[res  ] {key}: CPU 均值 {_f(rz.get('cpu_cores_mean'))} 核 / "
+                          f"峰值 {_f(rz.get('cpu_cores_max'))} 核，"
+                          f"GPU util 均值 {_f(rz.get('gpu_util_mean_pct'), '.1f')}% / "
+                          f"峰值 {_f(rz.get('gpu_util_max_pct'), '.1f')}%，"
+                          f"显存 {_f(rz.get('gpu_mem_used_max_mib'), '.0f')} MiB"
+                          f"（采样 {rz.get('gpu_samples')} 点 @ {rz.get('interval_s')} s）")
                 if kind == "serial":
                     serial_ref = results
                     serial_rep = rep
