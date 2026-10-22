@@ -296,12 +296,13 @@ sha256 `eccfd964426a2637` 这一份清单（`--align-n 16 --bench-n 30 --val --v
 | `tests/test_make_calib_list.py` | 24 | 校准清单：`class_of` 从路径反推类别、`dataset_root` 的三级回退、`build_list` 的等间距抽样与覆盖统计、拒绝 val/test split（校准集只能用 train，防止拿评测集校准）、拒绝 n<=0 与母体不足、幂等（同参数重跑同指纹）、指纹不同拒绝覆盖、瘦类别覆盖告警、dry-run 不落盘、写出的清单能被 strict 模式读回 |
 | `tests/test_build_trt.py` | 50 | `pin_layers_fp16`（失败对照）与 `constrain_head_precisions`（能过的配方）：头是最大 model 索引、sigmoid→FP32、`.2/Conv` 与 `/dfl/`→FP16、非头层不动、无名层不崩、逐输出都 set；`make_calibrator` 的批生命周期（`get_batch` 返回裸 `data_ptr()`，张量必须挂在 `self._cur`）、`get_algorithm` 已重写、`CALIB_ALGOS` 映射、缓存命中/未命中/写缓存建父目录、缺基类与缺枚举时报错指向下一步；`load_calib_inputs` 的分批与跳过留痕；`--int8-pin` 与 `--int8-head` 互斥；`main` 的返回码（2 用法/输入、3 缺 tensorrt）与 dry-run 命名推导；**新增 4 条**盖 TF32：fake builder 全链路 harness（`FakeConfig` 记 `set_flag`/`clear_flag`，`FakeLogger` 必须是真类 —— `SimpleNamespace` 塞 `__call__` 不生效）、默认开 TF32、`--no-tf32` 真的 `clear_flag`、与 FP16 flag 共存（断言用 `set()`，顺序不重要）、dry-run 报 `tf32=` 状态 |
 | `tests/test_bench_trt.py` | 62 | 三层判据逐条：`align_engine` 的形状前置与逐输出指标、`check_align` 的 cosine/rel_l2 卡线、`gate_tier` 三档各自的判据（含 INT8 只看 mAP）、`low_prec_share` 的层格式占比、`build_report_tiers` 读构建报告（键是 `engines` 不是 `builds`）、`build_table` 引报告里的体积/层数、`latency_stats` 分位、`val_engine` 的 mAP 抽取、`_md` 渲染（无参照时的 `—`）、`main` 的缺 engine/缺 data.yaml 返回 2、run 名从权重路径反推、阈值覆盖只作用在 fp32/fp16；**阈值那条改写成** `test_thresholds_fp32_fp16_match_their_numeric_format`（卡 1e-2，理由写在注释里：按数值格式的机器精度定判据，最终判据是端到端 mAP），另加 `test_rel_l2_threshold_still_admits_tightening_via_cli`（`--max-rel-l2 1e-5 --dry-run` 仍可收紧，判据不是写死的） |
-| `tests/test_pipeline.py` | 168 | 环形队列、后处理、掩码解码、流水线保序/错误传播、对拍匹配、加速比口径 |
+| `tests/test_pipeline.py` | 183 | 环形队列、后处理、掩码解码、流水线保序/错误传播、对拍匹配、加速比口径；**端到端延迟 15 条**（`e2e_latency`）：e2e ≥ 各阶段耗时之和、`1000/e2e 均值 ≈ FPS` 两套数互验、**排队效应（流水线 e2e P50 > 1.5× 串行，守的是「时间戳打在 `put` 之前」，打在之后就等于把背压藏起来）**、capacity 变大 e2e 随之变大 |
+| `tests/test_prof.py` | 87 | 资源采样器：`nvidia-smi` 输出解析（`[N/A]` / `[Not Supported]` / 垃圾 / 多行只取首行）、`smi_sample` 的 17 条失败路径全回 None 且**绝不抛**（子进程缺失/超时/非零退出）、`cpu_cores` 的核当量与「读数倒退不许报负数」、`ResourceSampler` 的参数校验（≤0 / **NaN** / 非数字 / 字符串数字收敛）+ 注入假时钟做确定性断言、采样点计数、start 幂等、stop 幂等且 join、daemon 线程名 |
 | `tests/test_pinned.py` | 59 | 令牌池、non_blocking、每帧单 sync、出错还令牌（全用假对象，不碰 GPU） |
 
-全量 **790 passed / 6 skipped**（base 环境 `W:\Anaconda\python.exe`，纯 CPU、不联网、
-不需要真实数据集，18.32 s）。W3b 新增 172 条：trt_infer 36 / make_calib_list 24 /
-build_trt 50 / bench_trt 62；W4① 再新增 227 条：pipeline 168 / pinned 59。
+全量 **892 passed / 6 skipped**（base 环境 `W:\Anaconda\python.exe`，纯 CPU、不联网、
+不需要真实数据集，19.88 s；跳的 6 条是 onnx 4 + ultralytics 2）。W3b 新增 172 条：trt_infer 36 /
+make_calib_list 24 / build_trt 50 / bench_trt 62；W4① 再新增 329 条：pipeline 183 / pinned 59 / prof 87。
 **这些测试既不需要装 tensorrt，也不需要 GPU** —— `build_trt` / `bench_trt` 里的
 `import tensorrt` 全部延迟到函数内，流水线的环形队列、令牌池与 CUDA 流交互全用假对象断言
 （连"每帧只 synchronize 一次""异常路径要把令牌还回池子"都是测出来的），CI 只跑逻辑不跑 GPU。

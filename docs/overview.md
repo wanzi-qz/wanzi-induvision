@@ -219,12 +219,20 @@ GPU 三分之二时间在等图），所以流水线能把 GPU 那段整个藏�
 省的就是每帧 4.7 MiB 的 H2D 与输出 D2H。加速比的分母一律是**同一轮同机同批**的 `run_serial`，
 不是 §3.3b 的单帧延迟（那组输入常驻显存、不含拷贝与前后处理，两个口径相除得到的倍数没有物理意义）。
 
+500 帧那轮（50 张 × 10 轮）把**延迟与资源占用**补齐了：串行端到端 P50 24~27 ms，流水线 P50 98~107 ms
+（放大 **4.0~4.2×**），换来 ~40 → ~65 FPS（+60%）；串行的在飞帧数按 Little's law（L = λ·W）反推是 **1.00**，
+等于自证延迟的时间戳口径没打错地方。CPU **1.10 → 1.65 核当量**（峰值 2.81 / 16 逻辑核），
+GPU util A 组只有 **28~37%**（与 TensorRT 侧 infer util 0.33~0.46 两个独立口径互证），B 组最高 **92.9% 均值 / 95% 峰值**。
+顺带量到两条口径陷阱：资源采样器（200 ms 一次 `nvidia-smi` 子进程）的扰动**小于机器噪声底 3.57%**，所以默认关；
+而带 `--check-ultralytics` 对拍会把同一轮后面的吞吐数污染 **8.57%** —— 验精度与报吞吐必须分两轮跑。
+详见 [pipeline.md](pipeline.md) §6.5。
+
 ### 3.4 工程
 
 | 项 | 值 |
 | --- | --- |
-| 单测 | **790 条 pytest**（W4① 新增 227 条：pipeline 168 / pinned 59；W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62），纯 CPU、不联网、不需要真实数据集、也不需要装 tensorrt 与 torch（`import tensorrt` / `import torch` 全延迟到函数内，pinned 那 59 条用注入的假对象覆盖），base 环境 18.3 s |
-| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件与 W4① 新增的 2 个在 CI 里全量跑（本地用 `_cishim` 模拟无 torch 环境实测：pipeline + pinned 226 passed / 1 skipped） |
+| 单测 | **892 条 pytest**（W4① 新增 329 条：pipeline 183 / pinned 59 / prof 87；W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62），纯 CPU、不联网、不需要真实数据集、也不需要装 tensorrt 与 torch（`import tensorrt` / `import torch` 全延迟到函数内；pinned 那 59 条用假 CUDA 流/假张量覆盖，prof 那 87 条用假 `nvidia-smi` 子进程 + 假时钟覆盖），base 环境 19.9 s = 892 passed / 6 skipped（跳的是 onnx 4 条 + ultralytics 2 条） |
+| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件与 W4① 新增的 3 个在 CI 里全量跑（本地把 torch 屏蔽掉模拟无 torch 环境实测：pipeline + pinned + prof 328 passed / 1 skipped） |
 | 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 | 入库边界 | CI 断言守着：`git ls-files` 出现 `data/`、`weights/`、`out/`、`runs/` 或任何 `.pt/.onnx/.engine/.trt` 就失败 |
 

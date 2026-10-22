@@ -60,7 +60,7 @@ tools/
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
 configs/             入库的配置：bench_sample.json 固定抽样清单（部署校验的口径基准）、
                      calib_sample.json INT8 校准清单（train split 500 张），都带 sha256 指纹
-tests/               790 条 pytest，纯 CPU、不联网、不需要真实数据集
+tests/               892 条 pytest，纯 CPU、不联网、不需要真实数据集
 docs/                overview.md 项目说明（背景 / 方法 / 结果，先看这个）
                      environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
@@ -135,7 +135,10 @@ python tools/bench_pipeline.py --preload --check-ultralytics --markdown  # B 组
 # B 组是把图先读进内存、只量推理链路的上限：INT8 330.05 FPS（1.413x）
 # 两组数字别混着读，为什么见 docs/pipeline.md §5
 
-# 8) 单测（790 条，约 18 秒；base 环境没装 torch/onnx 会自动跳 6 条）
+# 端到端延迟 + CPU/GPU 占用（500 帧 = 50 张 × 10 轮；采样默认关，扰动实测小于噪声底）
+python tools/bench_pipeline.py --frames 50 --repeats 10 --sample-resources --markdown
+
+# 8) 单测（892 条，约 20 秒；base 环境缺 onnx/ultralytics 会自动跳 6 条）
 python -m pytest -q
 ```
 
@@ -278,6 +281,16 @@ A 组里 pinned 与 plain 基本打平（fp32 两者流水线都是 57.53 FPS；
 INT8 流水线 330.05 vs plain 263.20（**+25%**），省下的正是每帧新建可分页缓冲的那次同步拷贝。
 两组口径与这笔账见 [docs/pipeline.md](docs/pipeline.md) §5 / §6.1 / §6.2。
 
+吞吐是拿单帧延迟换的，这笔账也量了（500 帧 = 50 张 × 10 轮，A 组含磁盘，同一台机器）：
+串行端到端 **P50 24~27 ms / P95 29~33 ms**，流水线 **P50 98~107 ms / P95 118~132 ms**，
+放大 **4.0~4.2×**，换来 ~40 → ~65 FPS（**+60%**）。串行的在飞帧数按 Little's law（L = λ·W）反推是
+**1.00**（三位有效数字内），等于自证延迟的时间戳没打错地方；流水线约 **6.4 帧在飞**，
+缓冲上限 15 只用了 43%（瓶颈在源头，加缓冲只加等待）。CPU 从 **1.10 核当量**涨到 **1.65 核**
+（峰值 2.81，16 逻辑核）；GPU util A 组只有 **28~37%**，和 TensorRT 侧的阶段 util 0.33~0.46 互证，
+把磁盘拿掉（B 组）才冲到 **92.9% 均值 / 95% 峰值**，INT8 pinned 流水线 **316.66 FPS**。
+离线批量质检要吞吐、在线联动产线要延迟（那时该把 capacity 调小甚至退回串行），**两个数都得报**。
+详见 [docs/pipeline.md](docs/pipeline.md) §6.5。
+
 与 ultralytics 参照实现对拍（同图同阈值，FP32/FP16 13/13、INT8 17/17 检出全部配上）：
 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.9100~0.9158（判据 0.85），三档各 10/10 条判据
 全过、verdict **pass**。掩码那 0.09 的差不是随机噪声：第一版把 proto mask 按框尺寸拉伸是错的
@@ -285,9 +298,10 @@ match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.9100~0.9158（判据 0
 [docs/pipeline.md](docs/pipeline.md) §4.2。常驻显存与 pinned 主机内存各 **18.893 MiB**
 （pool_size 2；调到 3/4/6 吞吐几乎不动，见 §7）。
 
-测试规模 563 → **790** 条 pytest（W4① 新增 227 条：pipeline 168 / pinned 59）。
-这 227 条一条都不碰 GPU —— 环形队列、令牌池、CUDA 流全用假对象测，
-连"每帧只 synchronize 一次""出错要把令牌还回池子"都是断言出来的。
+测试规模 563 → **892** 条 pytest（W4① 新增 329 条：pipeline 183 / pinned 59 / prof 87，其中 500 帧端到端延迟与资源采样这轮又补了 102 条）。
+这 329 条一条都不碰 GPU —— 环形队列、令牌池、CUDA 流、`nvidia-smi` 子进程全用假对象测，
+连"每帧只 synchronize 一次""出错要把令牌还回池子""采样线程遇 `[N/A]` 不许抛"都是断言出来的。
+延迟那条还钉了一个反直觉的口径：**时间戳必须打在 `put` 之前**，否则背压被藏起来、P95 好看但没意义。
 
 ## 许可与入库边界
 

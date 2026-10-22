@@ -5,6 +5,10 @@
 **1.44~1.71×**（含磁盘读图的真实口径）；把图预先常驻内存、隔离掉磁盘之后是 **1.19~1.42×**，
 INT8 档流水线 **330 FPS**。三档全部通过 10 条判据，与 ultralytics 对拍 match_rate **1.0000**、
 框 IoU **1.0000**、掩码 IoU **0.910~0.916**。
+吞吐是拿单帧延迟换的：500 帧实测流水线端到端 **P50 98~107 ms / P95 118~132 ms**，
+是串行（P50 24~27 ms）的 **4.0~4.2 倍**，代价换来 +60% 吞吐（§6.5）。
+CPU 吃 **1.65 核当量**（串行 1.10），含磁盘那组 GPU util 只有 **28~37%**，
+把磁盘拿掉才冲到 **93%**（§6.5.3）。
 
 按 **背景 → 方法 → 结果 → 踩坑** 读。本文所有数字都来自本机实测，
 原始报告在 `runs/logs/pipeline_baseline15*.json`（不入库），表格由脚本从 JSON 生成，不手抄。
@@ -360,11 +364,6 @@ git `625e279` + 本轮改动。队列容量 4，`pool_size` 2，imgsz 640，掩�
 | fp32 | 10 / 10 | 无 |
 | fp16 | 10 / 10 | 无 |
 | int8 | 10 / 10 | 无 |
-| 档 | 通过判据数 | 失败 |
-|---|---|---|
-| fp32 | 10 / 10 | 无 |
-| fp16 | 10 / 10 | 无 |
-| int8 | 10 / 10 | 无 |
 
 10 条 = 保序 ×2（plain/pinned）+ 结果条数 ×2 + 与串行逐帧一致 ×2 + 加速比 ≥1.0 +
 对拍 match_rate ≥0.98 + 框 IoU ≥0.99 + 掩码 IoU ≥0.85。
@@ -372,6 +371,183 @@ git `625e279` + 本轮改动。队列容量 4，`pool_size` 2，imgsz 640，掩�
 「与串行逐帧一致」比的是 `(n_det, mask_pixels, score_sum)` 三元组，300 帧全等（`n_diff: 0`）。
 这条钉的就是 §3.5 说的跨帧数据竞争：**如果令牌池串了槽，这里会偶发不一致**，
 而且是负载相关的偶发 —— 跑一次过了不代表对。
+
+### 6.5 500 帧端到端延迟与 CPU/GPU 占用
+
+W4 计划里还差两个数：**500 帧的逐帧端到端 P50/P95** 和 **压测期间的 CPU/GPU 占用**。
+补上这两个，"流水线值不值"才算说完整 —— 只报 FPS 会掩盖延迟恶化，只报延迟又让人以为流水线没用。
+
+环境同 §6（Python 3.12.5 / torch 2.13.0+cu130 / tensorrt 10.16.1.11 / RTX 4060 Laptop 8GB / 16 逻辑核），
+git `c645e19` + 本轮改动，原始报告 `runs/logs/pipeline500_*.json`（不入库）。
+
+#### 6.5.1 口径先说清楚：这一节是 500 帧，和 §6.1 的 300 帧不能横向比绝对值
+
+同一份清单（`configs/bench_sample.json`，母体 64/435，sha256 `eccfd964426a2637`）取
+**前 50 张 × 10 轮 = 500 帧**，其余参数与 §6.1 完全一致（capacity 4、pool_size 2、imgsz 640、掩码解码开）。
+
+图换了（30 张 → 50 张），decode 耗时跟着变，所以绝对 FPS 比 §6.1 高一截
+（fp32 pinned 串行 40.70 vs §6.1 的 36.86）。**加速比反而更稳**：本轮四跑 12 格落在
+**1.44~1.67×**，§6.1 是 1.44~1.71×。老规矩：跨轮跨清单只比同轮内部的串行/流水线之比，绝对值不外推。
+
+#### 6.5.2 端到端延迟：流水线的 P50 是串行的 4 倍，这是正常的
+
+两个口径别混：**阶段耗时**（§6.1 表里那三列）是"这一帧在某段里被处理了多久"，加起来是干活时间；
+**端到端延迟**是"这一帧从进队到结果出来经过了多久"，**含在队列里等的时间**。
+
+A 组（含磁盘，500 帧，采样关，`runs/logs/pipeline500_nosample2.json`）：
+
+| 档 | 缓冲 | 串行 P50 | 串行 P95 | 串行 max | 流水线 P50 | 流水线 P95 | 流水线 max | P50 放大 |
+|---|---|---|---|---|---|---|---|---|
+| fp32 | plain | 24.513 | 28.919 | 78.694 | 102.675 | 126.342 | 135.140 | 4.19x |
+| fp32 | pinned | 24.980 | 29.848 | 34.388 | 100.121 | 120.379 | 131.493 | 4.01x |
+| fp16 | plain | 23.540 | 29.754 | 33.325 | 99.820 | 119.248 | 125.177 | 4.24x |
+| fp16 | pinned | 24.329 | 31.201 | 34.947 | 98.287 | 117.942 | 126.634 | 4.04x |
+| int8 | plain | 25.292 | 30.506 | 37.151 | 105.452 | 132.479 | 146.781 | 4.17x |
+| int8 | pinned | 26.850 | 33.322 | 38.653 | 107.404 | 131.391 | 141.955 | 4.00x |
+
+（单位 ms。同轮 FPS：串行 36.47~42.67，流水线 59.56~65.91。）
+
+**读法**：串行 P50 24~27 ms，流水线 P50 98~107 ms，放大 **4.00~4.24×**；
+同一台机器同一批图，吞吐从 ~40 FPS 涨到 ~65 FPS（**+60%**）。
+这就是"用单帧延迟换吞吐"的账面 —— 帧在队列里排着，所以每帧的**体感**变慢，
+但单位时间**处理完的帧数**变多。要不要这笔交易看场景：离线批量质检要吞吐，
+在线联动产线要延迟（那时候该把 `capacity` 调小，甚至退回串行）。**报数时两个都得给。**
+
+**Little's law 交叉验证**（L = λ·W，在飞帧数 = 吞吐 × 端到端延迟）：
+
+| 组合 | 串行 L | 流水线 L | 缓冲上限 |
+|---|---|---|---|
+| fp32 pinned | **1.00** | 6.49 | 15 |
+| fp16 pinned | **1.00** | 6.42 | 15 |
+| int8 pinned | **1.00** | 6.41 | 15 |
+
+串行那一列全是 **1.00** —— 不是约等于，是三位有效数字内的 1.00。串行本来就只有一帧在飞，
+这个数等于 1 说明 **e2e 的时间戳口径是自洽的**：时间戳要是打错了地方（打在 `put` 之后、
+或者漏掉了排队那一段），L 就会偏掉。这条比任何单元测试都硬，因为它是拿两组独立测出来的数
+（FPS 和 e2e 均值）互推的。
+
+流水线 L ≈ 6.4 帧在飞，缓冲上限是 `capacity(4) × 3 段 + 3 个正在处理的 = 15`，只用了 **43%**。
+队列没顶满，因为 decode 是瓶颈（util 1.00），后两段一直在等它，q1/q2 大部分时间是空的。
+**这顺手解释了为什么把 capacity 从 4 调到 8 收益不大**：瓶颈在源头，加缓冲只是让帧多等一会儿
+（e2e 变大，FPS 不变）。
+
+B 组（preload，500 帧，`runs/logs/pipeline500_preload_sampled.json`）：
+
+| 档 | 缓冲 | 串行 FPS | 串行 P50 | 串行 P95 | 流水线 FPS | 流水线 P50 | 流水线 P95 | P50 放大 |
+|---|---|---|---|---|---|---|---|---|
+| fp32 | plain | 123.33 | 7.866 | 9.030 | 140.60 | 79.698 | 84.857 | 10.13x |
+| fp32 | pinned | 127.31 | 7.696 | 8.826 | 157.31 | 50.488 | 52.114 | 6.56x |
+| fp16 | plain | 200.07 | 4.795 | 6.497 | 249.16 | 45.402 | 50.822 | 9.47x |
+| fp16 | pinned | 215.19 | 4.462 | 5.726 | 299.19 | 26.035 | 29.732 | 5.83x |
+| int8 | plain | 207.87 | 4.605 | 6.217 | 275.93 | 41.031 | 46.518 | 8.91x |
+| int8 | pinned | 227.52 | 4.252 | 5.344 | **316.66** | 24.610 | 27.594 | 5.79x |
+
+放大倍数跳到 **5.8~10.1×**，比 A 组大。原因同上但更极端：单帧只要 4~8 ms，
+而 λ 涨到 250~317 FPS，L = λ·W 里的 W 自然被推高。
+注意 **pinned 的放大倍数（5.8~6.6×）明显小于 plain（8.9~10.1×）** ——
+pinned 流水线吞吐更高、单帧更快穿过队列，排队更短。这是 §6.2 那笔拷贝账在**延迟维度**上的另一面：
+pinned 不只是快，它还把延迟的尾巴压得更平（int8 P95 27.6 ms vs plain 46.5 ms）。
+
+#### 6.5.3 CPU/GPU 占用
+
+采样口径写在 `induvision/prof.py`：CPU 用 `time.process_time()`（**进程级**，所有线程之和）
+两次读数之差除以墙钟 = **核当量**，可以 > 1；GPU 走 `nvidia-smi --query-gpu` 子进程，200 ms 一次。
+不引 psutil —— 核心库的依赖边界是 numpy/opencv/pyyaml/标准库，为一个采样线程破例不值。
+
+跨 12 格聚合（A 组取 `pipeline500_sampled2.json`，B 组取 `pipeline500_preload_sampled.json`）：
+
+| 组 | 模式 | CPU 核当量 均值 | CPU 峰值(最大) | GPU util 均值 | GPU util 峰值(最大) | 整机显存 MiB |
+|---|---|---|---|---|---|---|
+| A 含磁盘 | 串行 | 1.105（1.064~1.133） | 1.93 | 31.5%（29.4~33.6） | 46% | 2439 / 2523 |
+| A 含磁盘 | 流水线 | **1.654**（1.601~1.724） | 2.81 | 33.6%（28.3~37.0） | 60% | 2439 / 2523 |
+| B preload | 串行 | 1.079（1.009~1.212） | 1.81 | 60.1%（42.7~75.2） | 94% | 2439 / 2523 |
+| B preload | 流水线 | **1.600**（1.366~1.887） | 2.46 | 70.8%（42.0~92.9） | 95% | 2439 / 2523 |
+
+逐格明细（24 行）：
+
+| 组 | 档 | 缓冲 | 模式 | FPS | CPU 均值 | CPU 峰值 | GPU util 均值 | GPU util 峰值 | 整机显存 MiB | 采样点 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | fp32 | plain | serial | 41.22 | 1.128 | 1.730 | 29.4% | 46% | 2523 | 48 |
+| A | fp32 | plain | pipeline | 59.26 | 1.724 | 2.162 | 36.1% | 51% | 2523 | 32 |
+| A | fp32 | pinned | serial | 40.66 | 1.082 | 1.931 | 32.5% | 45% | 2523 | 49 |
+| A | fp32 | pinned | pipeline | 63.94 | 1.679 | 2.771 | 37.0% | 48% | 2523 | 31 |
+| A | fp16 | plain | serial | 40.24 | 1.117 | 1.754 | 29.8% | 44% | 2439 | 49 |
+| A | fp16 | plain | pipeline | 63.88 | 1.655 | 2.205 | 32.5% | 44% | 2439 | 30 |
+| A | fp16 | pinned | serial | 38.71 | 1.064 | 1.434 | 33.6% | 46% | 2439 | 51 |
+| A | fp16 | pinned | pipeline | 64.68 | 1.643 | 2.412 | 35.4% | 54% | 2439 | 30 |
+| A | int8 | plain | serial | 38.55 | 1.104 | 1.640 | 32.6% | 44% | 2439 | 51 |
+| A | int8 | plain | pipeline | 64.70 | 1.601 | 2.165 | 32.5% | 60% | 2439 | 30 |
+| A | int8 | pinned | serial | 39.89 | 1.133 | 1.737 | 31.1% | 42% | 2439 | 50 |
+| A | int8 | pinned | pipeline | 65.09 | 1.621 | 2.808 | 28.3% | 53% | 2439 | 30 |
+| B | fp32 | plain | serial | 123.33 | 1.029 | 1.303 | 64.8% | 76% | 2523 | 16 |
+| B | fp32 | plain | pipeline | 140.60 | 1.484 | 2.094 | 81.7% | 85% | 2523 | 14 |
+| B | fp32 | pinned | serial | 127.31 | 1.018 | 1.085 | 75.2% | 84% | 2523 | 16 |
+| B | fp32 | pinned | pipeline | 157.31 | 1.366 | 1.919 | 92.9% | 95% | 2523 | 13 |
+| B | fp16 | plain | serial | 200.07 | 1.212 | 1.812 | 63.5% | 94% | 2439 | 10 |
+| B | fp16 | plain | pipeline | 249.16 | 1.439 | 2.070 | 68.0% | 73% | 2439 | 8 |
+| B | fp16 | pinned | serial | 215.19 | 1.069 | 1.333 | 62.1% | 73% | 2439 | 9 |
+| B | fp16 | pinned | pipeline | 299.19 | 1.887 | 2.353 | 76.7% | 87% | 2439 | 7 |
+| B | int8 | plain | serial | 207.87 | 1.140 | 1.805 | 42.7% | 87% | 2439 | 10 |
+| B | int8 | plain | pipeline | 275.93 | 1.671 | 2.461 | 42.0% | 65% | 2439 | 7 |
+| B | int8 | pinned | serial | 227.52 | 1.009 | 1.306 | 52.0% | 62% | 2439 | 9 |
+| B | int8 | pinned | pipeline | 316.66 | 1.750 | 2.395 | 63.3% | 72% | 2439 | 6 |
+
+三条读数：
+
+- **CPU：串行 ~1.10 核，流水线 ~1.65 核**，峰值 2.81 核。三条工作线程只吃到 1.65 核而不是 3 核 ——
+  GIL 是一部分原因，更主要的是**大部分时间在等**（等磁盘、等 GPU、等令牌），§7 已经用
+  `pool_size` 消融证过这件事。报"1.65 核当量"比报"CPU 占用 165%"有用：
+  后者随机器核数失真（16 核机器上的 165% 和 4 核机器上的 165% 完全是两件事），前者不会。
+- **GPU util：A 组只有 28~37%，B 组 42~93%**。A 组低是因为 CPU 前处理喂不满 GPU，
+  这和 §6.1 的 infer util 0.33~0.46 完全对得上 —— **两个独立口径（TensorRT 侧的阶段 util
+  和 nvidia-smi 侧的整卡 util）互相印证**，不是巧合。B 组把磁盘拿掉后 fp32 pinned 流水线冲到
+  **92.9% 均值 / 95% 峰值**，这才是这块卡在这套模型上的真实上限。
+- **显存那两列（2439 / 2523 MiB）是 nvidia-smi 的整机读数，含桌面、浏览器和其他进程**，
+  不是模型占用。模型侧的数是 §3.5 的 **18.893 MiB**（pinned host + device 各一份）。
+  两个数差 130 倍，混着报会闹笑话，所以表头写死"整机显存"。
+  fp32 档 2523、fp16/int8 档 2439，差 84 MiB ≈ engine 体积差（65.25 vs 24.58/12.55 MiB）
+  加上 TensorRT 工作区，量级对得上。
+
+#### 6.5.4 采样器扰动实测：测不出来（这一段是本轮最值钱的）
+
+`--sample-resources` 每 200 ms 起一个 `nvidia-smi` 子进程，这玩意儿自己要吃 CPU。
+按直觉它会把被测对象拖慢，所以**默认关**。但"直觉上会拖慢"不能写进文档，
+于是做了一组 A/B：**同一份 500 帧配置跑四轮**，只有采样开关和是否带对拍在变
+（`pipeline500_nosample.json` / `nosample2` / `sampled` / `sampled2`）。
+
+| 对比 | FPS 相对差 均值 | 最小 | 最大 | 绝对值均值 |
+|---|---|---|---|---|
+| 无采样(RUN4) → 开采样(RUN2) | −1.38% | −12.29% | +9.20% | 4.92% |
+| 无采样(RUN4) → 开采样(RUN5) | −0.31% | −7.00% | +9.38% | 4.28% |
+| 开采样(RUN2) → 开采样(RUN5)　**← 噪声底** | +1.26% | −7.02% | +11.84% | **3.57%** |
+| 无采样(RUN1) → 无采样(RUN4)　**← 噪声底（含对拍差）** | +4.77% | −9.92% | +22.94% | **8.57%** |
+
+每格 12 个（3 档 × 2 缓冲 × 2 模式），相对差 = (后一轮 FPS − 前一轮 FPS) / 前一轮 FPS。
+
+**结论：采样器的扰动被机器噪声完全淹没了。**
+同配置两轮之间的 |差| 均值本来就有 **3.57%**，开了采样只多 0.7~1.3 个百分点，
+12 格里有 5 格开了采样反而更快 —— 这在统计上就是"测不出来"。
+
+中途我一度以为测出来了：RUN2 的 fp32 pinned_pipeline 只有 **57.17 FPS**，
+比 RUN4 的 65.18 低 **12.3%**，看着就是采样器干的。但同一格 RUN5 又跑回 **63.94 FPS**。
+单格 −12% 是噪声，不是效应 —— **这正是为什么必须跑两轮以上才敢下结论**：
+一轮 A/B 的差值里，噪声和效应是分不开的，而笔记本 GPU 的噪声比台式机大得多
+（W3b 就记过 FP16 单帧延迟两轮差 +40%，时钟和温度都在飘）。
+
+所以"采样默认关"的真正理由**不是**"它扰动大"，而是这两条：
+
+1. **换不来更准的数**：既然扰动 < 噪声，开着它也提不了精度；
+2. **多一个失败面**：nvidia-smi 不在 PATH、驱动不认这几个字段、子进程超时、返回 `[N/A]`，
+   每一条都得兜（`tests/test_prof.py` 里 17 条 smi 失败路径的单测就是为此写的）。
+   为一个测不出差别的数字增加失败面，不值。
+
+要报资源占用就**单独跑一轮开采样的**。本节的 FPS/延迟表全部取自 RUN4（无采样），
+资源表全部取自 RUN5（开采样），**两组数字不同源，这是刻意的**，别拿它们互相除。
+
+顺带量到一个更狠的噪声源：**带不带 `--check-ultralytics` 差 8.57%**（RUN1 vs RUN4）。
+对拍那一步会另起一轮 `model.predict`，torch 的显存分配和 GPU 时钟状态都变了，
+后面几档的 FPS 跟着飘（fp16 串行 34.70 → 42.67，**+22.9%**）。
+**要报吞吐就关掉对拍单独跑，要验精度就单独跑对拍**，别指望一轮里两个数都干净。
 
 ---
 
@@ -489,6 +665,15 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
 10. **掩码数组不能留在结果里**。900×900 的 bool 一张 0.8 MiB，300 帧 × 每帧几个缺陷 = 几 GB，
     压测跑完机器就卡了。`FrameResult` 只留 `(n_det, mask_pixels, score_sum)` 统计量，
     只有对拍那一轮才带 `dets`。
+11. **端到端时间戳必须打在 `put` 之前**（§6.5.2）。打在之后就等于把背压藏起来，
+    P95 会好看但没有意义。守它的是 `test_pipeline_e2e_exceeds_serial_because_of_queueing`
+    和 Little's law 那条 L=1.00。
+12. **一轮 A/B 分不开噪声和效应**（§6.5.4）。单格 −12.3% 看着像采样器拖的，
+    再跑一轮同一格回到 −1.9%。笔记本 GPU 的噪声底就有 3.6%，结论至少要两轮才敢下。
+13. **`--check-ultralytics` 会污染后面的吞吐数**（§6.5.4，差 8.57%）。验精度和报吞吐分两轮跑。
+14. **`float("nan") <= 0` 是 `False`**。采样间隔的校验写成 `if interval_s <= 0` 会放 NaN 过去，
+    接着 `Event.wait(nan)` 抛 ValueError 被兜底 `except` 吞掉，采样线程一轮就悄悄退出，
+    报告里只剩 `gpu_available=False`，看着像"这台机器没显卡"。判据要写 `if not x > 0`。
 
 ---
 
@@ -508,8 +693,11 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
    别把这条当成 C++ 版的卖点写进报告，卖点是 1 和 2。
 4. **修度量口径**：把 `acquire` 等待单独计时（`decode_wait_ms` vs `decode_busy_ms`），
    `bottleneck_stage` 用后者判；`pool_size` 默认提到 3~4（本轮实测对吞吐无害，对报表诚实）。
-5. **500 张端到端 P50/P95 压测**：本轮是 30 张 × 10 轮，量的是稳态吞吐；
-   C++ 版按原计划上 500 张，报 P50/P95/P99 + CPU/GPU 占用。
+5. **把 §6.5 那套 500 帧口径搬到 C++ 上重跑**：Python 侧的基线已经有了
+   （500 帧 = 50 张 × 10 轮，报 e2e P50/P95/max + CPU 核当量 + GPU util/整机显存），
+   C++ 版用**同一份清单、同一套分位口径**再跑一遍，直接和那张表对读。
+   还差两个数：**P99**（Python 版只报到 max）和 `decode_wait_ms` / `decode_busy_ms` 的拆分（见第 4 条）。
+   注意别拿 C++ 的 500 帧数去比 Python 的 300 帧数 —— 图不一样，decode 不一样（§6.5.1）。
 6. **CMake 工程**：engine 反序列化 → CUDA 流 → 前处理 → 推理 → 后处理（NMS + 掩码解码），
    后处理直接照搬本轮的 Python 语义（§4），**并且拿本轮的对拍结果当验收标准**：
    match_rate ≥0.98、框 IoU ≥0.99、掩码 IoU ≥0.85，一条都不能松。
@@ -520,20 +708,33 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
 
 | 文件 | 条数 | 覆盖 |
 | --- | --- | --- |
-| `tests/test_pipeline.py` | **168** | `RingBuffer`：容量边界、put/get 往返、满/空阻塞与超时返回、`close` 幂等与唤醒所有等待者、关闭后 put 抛错而 get 返回 `None`、`max_depth`/`puts`/`gets` 计数、**等待计数按调用记不按循环轮数记（5 条专门钉这个口径）**；后处理：`_as_predictions` 的形状与属性数、`cxcywh_to_xyxy`、`iou_one_vs_many` 的退化情形（零面积、完全重合、不相交）、`nms` 的分数排序与 iou 阈值边界、`batched_nms` 按类隔离（不同类不互相压制）、`scale_boxes_to_orig` 的 pad/ratio 口径与越界裁剪；掩码：`masks_from_proto` 的 3D/4D proto、batch>1 抛错、coeffs 与 boxes 数量不一致抛错、框在网格外返回全 False、退化框返回全 False、阈值越高掩码越小、**与「整图放大再裁剪」参照实现比对（§4.2 的真 bug 就是这么抓出来的，已固化成回归测试）**、**贴回面积按网格几何算（偏差 <2%）**、掩码不越出图像、`mask_iou` 的两个都空=1.0 / 只有一个空=0.0 / 形状不一致抛错 / `erode_px` 负数抛错 / 腐蚀能把两个都清空；`postprocess`：conf/iou/max_det/mask 四个阈值各自的作用、`need_masks=False` 时 mask 为 None、分数不再套 sigmoid（分数值域与排序）、无检出时返回空；对拍：`match_detections` 的全配 / 漏配 / 多配 / 空对空、`Detection.to_dict` 的掩码像素数与 None 分支；流水线：`run_serial` 与 `Pipeline` 结果逐条相等、保序（乱序 stage 也保序）、多阶段与单阶段、空输入、stage 抛错包成 `PipelineError(stage, index, exc)`、错误后所有线程收尾不悬挂、`speedup_report` 的加速比与瓶颈判定、`_stage_report` 的 util 与分位、加速比对照的分母口径 |
+| `tests/test_pipeline.py` | **183** | `RingBuffer`：容量边界、put/get 往返、满/空阻塞与超时返回、`close` 幂等与唤醒所有等待者、关闭后 put 抛错而 get 返回 `None`、`max_depth`/`puts`/`gets` 计数、**等待计数按调用记不按循环轮数记（5 条专门钉这个口径）**；后处理：`_as_predictions` 的形状与属性数、`cxcywh_to_xyxy`、`iou_one_vs_many` 的退化情形（零面积、完全重合、不相交）、`nms` 的分数排序与 iou 阈值边界、`batched_nms` 按类隔离（不同类不互相压制）、`scale_boxes_to_orig` 的 pad/ratio 口径与越界裁剪；掩码：`masks_from_proto` 的 3D/4D proto、batch>1 抛错、coeffs 与 boxes 数量不一致抛错、框在网格外返回全 False、退化框返回全 False、阈值越高掩码越小、**与「整图放大再裁剪」参照实现比对（§4.2 的真 bug 就是这么抓出来的，已固化成回归测试）**、**贴回面积按网格几何算（偏差 <2%）**、掩码不越出图像、`mask_iou` 的两个都空=1.0 / 只有一个空=0.0 / 形状不一致抛错 / `erode_px` 负数抛错 / 腐蚀能把两个都清空；`postprocess`：conf/iou/max_det/mask 四个阈值各自的作用、`need_masks=False` 时 mask 为 None、分数不再套 sigmoid（分数值域与排序）、无检出时返回空；对拍：`match_detections` 的全配 / 漏配 / 多配 / 空对空、`Detection.to_dict` 的掩码像素数与 None 分支；流水线：`run_serial` 与 `Pipeline` 结果逐条相等、保序（乱序 stage 也保序）、多阶段与单阶段、空输入、stage 抛错包成 `PipelineError(stage, index, exc)`、错误后所有线程收尾不悬挂、`speedup_report` 的加速比与瓶颈判定、`_stage_report` 的 util 与分位、加速比对照的分母口径；
+**端到端延迟 15 条**（`e2e_latency`）：串行 count 等于帧数、八个分位键都在、
+**e2e ≥ 各阶段耗时之和**（串行没有队列）、**1000/e2e 均值 ≈ FPS（两套数互为交叉验证，差 <20%）**、
+空输入、分位单调；`_report` 不传 e2e / 传 None / 传列表三种情形；
+流水线 count 等于帧数、空输入、值为正且有限、
+**排队效应（三段均衡 8 ms + capacity 3 → 流水线吞吐 >1.3× 且 e2e P50 >1.5× 串行，
+守的是「时间戳打在 put 之前」）**、**capacity=1 单阶段时在飞帧数 ≈2（比值落在 1.2~3.5）**、
+**capacity 变大 e2e 随之变大（延迟换吞吐的旋钮）** |
+| `tests/test_prof.py` | **87** | `induvision.prof`（W4① 补丁）：`_to_int` 的 `"2246 MiB"`/`"37 %"`/`"[N/A]"`/`"[Not Supported]"`/空/无数字/`"0"` 是 0 不是 None/负号不解析；`parse_smi` 的正常行、字段顺序与 `SMI_FIELDS` 一致、None/空、字段不足、多余字段忽略、**多行只取首行**、跳空行、**全 `[N/A]` 返回「值为空的字典」而不是 None**（命令通了但字段不支持 ≠ 没读到）、部分 `[N/A]`、垃圾、非字符串；`smi_sample` 用**注入的假 runner** 覆盖 17 条路径：成功、cmd 里有 `--id=` 与 `--query-gpu=`、timeout 传到位、`FileNotFoundError`/`OSError`/`TimeoutExpired`/`SubprocessError`/`ValueError`/returncode≠0/返回 None/stdout 是垃圾或 None/`[N/A]` 行、**不注入 runner 时也绝不抛**（CI 上没显卡）、多次调用按脚本顺序返回；`cpu_cores` 的多核、亚单核、四位小数舍入、Δ=0 是 0.0 不是 None、wall ≤0 或 None → None、**读数倒退 → None（不能报负核数）**；`_mean`/`_max` 的空表、过滤 None、舍入、返回 float；`ResourceSampler` 参数校验（interval ≤0、max_samples ≤0、**NaN**、非数字类型、字符串数字自动收敛）+ 用**注入假时钟**做确定性断言（wall 步进 1.0 / proc 步进 0.1 → 每区间 0.1 核，均值=峰值=0.1）、**行数 = max_samples+2**、核当量 >1、GPU 读数聚合、`gpu_index` 透传、smi 返回 None → `gpu_available=False` 而 CPU 那半边照记、**smi 抛异常不掀翻采样**、`[N/A]` 行算采样点但无有效值、start 两次是 no-op、stop 幂等且 join 线程、未 start 就 summary 全空、summary 的 14 个键、配置回显、上下文管理器、**summary() 不顺手停线程**、线程是 daemon 且叫 `res-sampler`、sleeper 收到的间隔数（采满 N 轮只 sleep N−1 次）、没采满就 stop 也不卡住 |
 | `tests/test_pinned.py` | **59** | 全部用**假 torch / 假 runner**，不碰 GPU：`require_torch` 与 `missing_gpu_dep_message` 的报错口径（要指出装哪份 requirements）、`PinnedOutputs.get/shapes`、`owned` 语义（自己 acquire 的要调用方 release，传进来的不动）；池：`_build_pool` 的 slot 数与 shape/dtype 解析、`_resolve_out_dtype`、`acquire`/`release` 往返、**令牌不串槽（并发拿两个令牌，写各自 slot 互不覆盖）**、池耗尽时 `acquire` 阻塞与 timeout、**出错路径也还令牌（异常后池子大小不变）**、`pool_waits` 计数、`forward` 每帧**只 `stream.synchronize()` 一次**（假流上数调用次数）、H2D/D2H 全部带 `non_blocking=True`（假张量上断言关键字参数）、`input_view` 返回的是 pinned 缓冲的视图不是副本（`np.copyto` 写进去能被 runner 读到）、`forward_array` 的自建令牌路径、`stats` 的字段、`close` 幂等、上下文管理器 `__enter__/__exit__`、没装 tensorrt 时的报错指向 `docs/environment.md §6` |
 
-这两个文件 **227 条**，加上原有的 563 条，全量 **790 passed / 6 skipped**（796 collected），
+W4① 三个文件 **329 条**（pipeline 183 / pinned 59 / prof 87），加上原有的 563 条，
+全量 **892 passed / 6 skipped**（898 collected，21.80 s），
 base 环境（`W:\Anaconda\python.exe`，纯 CPU、不联网、无 torch/tensorrt/真实数据集）。
 
-CI 怎么验：`test_pipeline.py` 只 import numpy/opencv，全量跑；`test_pinned.py` 靠注入假对象覆盖全部分支，
-只有 1 条 `importorskip("torch")` 会跳。无 torch 环境实测（`_cishim/torch/__init__.py` 里 `raise ImportError` +
-`PYTHONPATH=_cishim pytest`）：这两个文件 **226 passed / 1 skipped**。
+CI 怎么验：`test_pipeline.py` 与 `test_prof.py` 只 import numpy/opencv/标准库，全量跑；
+`test_pinned.py` 靠注入假对象覆盖全部分支，只有 1 条 `importorskip("torch")` 会跳。
+`test_prof.py` **不要求机器上有显卡**：`nvidia-smi` 通过 `runner` 注入假对象，
+时钟通过 `proc_clock`/`wall_clock`/`sleeper` 注入假读数，
+所以「驱动不在 / 超时 / 输出是垃圾 / 字段返回 `[N/A]`」这些生产上偶发一次就毁掉一轮压测的分支，
+在 CI 上是每次必跑且完全确定性的。无 torch 环境实测（临时目录里放一个 `torch/__init__.py` 直接 `raise ImportError`，
+再用 `PYTHONPATH` 顶掉真 torch）：pipeline + pinned + prof **328 passed / 1 skipped**。
 
 各文件条数：balance 12 / bench_trt 62 / build_trt 50 / copy_paste 38 / defect_bank 11 / deploy 51 /
 eval_seg 16 / export_onnx 15 / focal 25 / make_calib_list 24 / mvtec 32 / oversample_cli 20 /
-**pinned 59** / **pipeline 168** / summarize_ablation 64 / synth_cli 12 / tools_cli 9 / trt_infer 36 /
-verify_onnx 59 / verify_oversample 21 / yolo_dataset 12。
+**pinned 59** / **pipeline 183** / **prof 87** / summarize_ablation 64 / synth_cli 12 / tools_cli 9 /
+trt_infer 36 / verify_onnx 59 / verify_oversample 21 / yolo_dataset 12。
 
 ---
 
@@ -555,7 +756,18 @@ python tools/bench_pipeline.py --preload --modes pinned --pool-size 6
 # 只看 stage3 占比（关掉掩码解码）
 python tools/bench_pipeline.py --preload --no-masks
 
-# 单测（790 条，纯 CPU，base 环境即可）
+# §6.5.2 端到端延迟：500 帧，不开采样也不开对拍（FPS/延迟表用这一轮）
+python tools/bench_pipeline.py --frames 50 --repeats 10 --markdown `
+    --json-out runs/logs/pipeline500_nosample.json
+
+# §6.5.3 资源占用：500 帧 + CPU 核当量 / GPU util / 显存
+python tools/bench_pipeline.py --frames 50 --repeats 10 --sample-resources `
+    --sample-interval 0.2 --markdown --json-out runs/logs/pipeline500_sampled.json
+
+# §6.5.4 采样器扰动 A/B：把上面两条各跑两轮，比同格 FPS 相对差，
+# 再拿「两轮都开采样」的差值当噪声底。一轮分不开噪声和效应。
+
+# 单测（892 条，纯 CPU，base 环境即可）
 python -m pytest -q
 ```
 
