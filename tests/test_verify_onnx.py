@@ -415,3 +415,267 @@ def test_load_inputs_returns_empty_when_nothing_readable(tool, tmp_path: Path, c
         p.write_bytes(b"junk")
     xs, names = tool._load_inputs(tool.read_split_images(f["data"], "test"), imgsz=64)
     assert xs == [] and names == []
+
+# ----------------------------------------------------- 抽样口径（固定清单）
+#
+# 这一组盯的是"两次跑的是不是同一批图"。以前的抽样长度是 max(align_n, bench_n)，
+# 加不加 --bench-n 会换掉整批图，延迟数字对不上却查不出原因。现在清单是入库常量，
+# align / bench 都从它头上切，所以断言的重点全在**顺序、下标、来源留痕**这三件事上。
+
+def _write_manifest(paths, out, root, *, split="test", imgsz=640, source_total=None):
+    from induvision.deploy import write_sample_list
+
+    return write_sample_list(paths, out, root=root, split=split, imgsz=imgsz,
+                             source_total=source_total if source_total is not None else len(paths))
+
+
+def test_load_inputs_indexed_reports_original_positions(tool, tmp_path: Path, capsys):
+    """中间那张读不出来时，返回的下标必须是它在清单里的原位，不是存活序号。"""
+    f = _fake_run(tmp_path, n_test_images=3)
+    paths = tool.read_split_images(f["data"], "test")
+    paths[1].write_bytes(b"not-an-image")
+    xs, names, idx = tool._load_inputs_indexed(paths, imgsz=64)
+    assert len(xs) == 2 and idx == [0, 2]
+    assert names == [paths[0].name, paths[2].name]
+    assert "读不出来" in _stdout(capsys)
+
+
+def test_load_inputs_keeps_two_value_signature(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=2)
+    got = tool._load_inputs(tool.read_split_images(f["data"], "test"), imgsz=64)
+    assert len(got) == 2 and len(got[0]) == 2 and len(got[1]) == 2
+
+
+def test_take_upto_slices_by_index_not_by_position(tool):
+    """核心回归：一张坏图不能让后面所有图整体前移，那等于悄悄换了口径。"""
+    xs = ["a", "b", "c"]      # 字符串当哨兵，这里只验切片逻辑
+    idx = [0, 2, 3]           # 下标 1 那张读图失败被跳过了
+    assert tool._take_upto(xs, idx, 3) == ["a", "b"]     # 朴素 xs[:3] 会多给一个 "c"
+    assert tool._take_upto(xs, idx, 1) == ["a"]
+    assert tool._take_upto(xs, idx, 4) == ["a", "b", "c"]
+
+
+def test_take_upto_non_positive_limit_is_empty(tool):
+    assert tool._take_upto(["a"], [0], 0) == []
+    assert tool._take_upto(["a"], [0], -1) == []
+
+
+def test_resolve_sample_derives_equidistant_without_manifest(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=12)
+    images = tool.read_split_images(f["data"], "test")
+    absent = tmp_path / "absent.json"
+    picked, meta = tool.resolve_sample(images, root=f["data"].parent,
+                                       sample_list=absent, sample_n=5)
+    assert [str(q) for q in picked] == [str(q) for q in tool.sample_paths(images, 5)]
+    assert meta["source"] == "derived" and meta["count"] == 5
+    assert meta["source_total"] == 12 and meta["requested_n"] == 5
+    assert meta["path"] == str(absent) and len(meta["sha256"]) == 16
+    assert any("清单不存在" in w for w in meta["warnings"])   # 降级必须留痕
+
+
+def test_resolve_sample_uses_manifest_order_verbatim(tool, tmp_path: Path):
+    """清单顺序就是口径：即使它不是等间距、即使 --sample-n 说了别的数。"""
+    f = _fake_run(tmp_path, n_test_images=12)
+    images = tool.read_split_images(f["data"], "test")
+    want = [images[7], images[0], images[11]]
+    mf = tmp_path / "m.json"
+    wm = _write_manifest(want, mf, f["data"].parent, source_total=len(images))
+    picked, meta = tool.resolve_sample(images, root=f["data"].parent,
+                                       sample_list=mf, sample_n=5)
+    assert [str(q) for q in picked] == [str(q) for q in want]
+    assert meta["source"] == "manifest" and meta["count"] == 3
+    assert meta["sha256"] == wm["sha256"] and meta["warnings"] == []
+    assert meta["requested_n"] == 5 and meta["source_total"] == 12
+
+
+def test_resolve_sample_meta_names_are_relative(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    _picked, meta = tool.resolve_sample(images, root=f["data"].parent,
+                                        sample_list=tmp_path / "absent.json", sample_n=3)
+    assert meta["names"] == [f"images/test/{q.name}" for q in
+                             tool.sample_paths(images, 3)]
+    assert all(":" not in n for n in meta["names"])      # 报告里不该出现盘符
+
+
+def test_resolve_sample_warns_on_split_mismatch(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    mf = tmp_path / "m.json"
+    _write_manifest(images[:2], mf, f["data"].parent, split="val")
+    picked, meta = tool.resolve_sample(images, root=f["data"].parent,
+                                       sample_list=mf, sample_n=3, split="test")
+    assert meta["source"] == "derived"
+    assert any("split=val" in w for w in meta["warnings"])
+    assert len(picked) == 3
+
+
+def test_resolve_sample_warns_when_manifest_images_outside_split(tool, tmp_path: Path):
+    """清单里的图还在磁盘上，但不属于本次 split（比如清单是按 val 生成的）。
+
+    这种情况比"图丢了"更阴：文件存在、能读、能算指标，只是口径悄悄换了。
+    """
+    import cv2
+
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    ds = f["data"].parent
+    stranger = ds / "images" / "val" / "stranger.png"
+    stranger.parent.mkdir(parents=True, exist_ok=True)
+    assert cv2.imwrite(str(stranger), np.zeros((16, 16, 3), dtype=np.uint8))
+    mf = tmp_path / "m.json"
+    _write_manifest([stranger], mf, ds, split="test")   # split 对得上，图对不上
+    picked, meta = tool.resolve_sample(images, root=ds, sample_list=mf, sample_n=2)
+    assert meta["source"] == "derived" and len(picked) == 2
+    assert any("不在本次 test split 中" in w and "stranger.png" in w
+               for w in meta["warnings"])
+
+
+def test_resolve_sample_warns_when_manifest_root_is_another_dataset(tool, tmp_path: Path):
+    """清单整体指向另一份数据集：按本次 root 还原时图全缺，同样不能拿来当口径。"""
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    other = tmp_path / "elsewhere"
+    (other / "images" / "test").mkdir(parents=True)
+    import cv2
+    stranger = other / "images" / "test" / "stranger.png"
+    assert cv2.imwrite(str(stranger), np.zeros((16, 16, 3), dtype=np.uint8))
+    mf = tmp_path / "m.json"
+    _write_manifest([stranger], mf, other)
+    picked, meta = tool.resolve_sample(images, root=f["data"].parent,
+                                       sample_list=mf, sample_n=2)
+    assert meta["source"] == "derived" and len(picked) == 2
+    assert any("清单用不了" in w for w in meta["warnings"])
+
+
+def test_resolve_sample_strict_raises_instead_of_degrading(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    mf = tmp_path / "m.json"
+    _write_manifest(images[:2], mf, f["data"].parent, split="val")
+    with pytest.raises(ValueError) as ei:
+        tool.resolve_sample(images, root=f["data"].parent, sample_list=mf,
+                            sample_n=2, split="test", strict=True)
+    assert "split" in str(ei.value)
+
+
+def test_resolve_sample_strict_raises_on_missing_manifest(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=3)
+    images = tool.read_split_images(f["data"], "test")
+    with pytest.raises(FileNotFoundError):
+        tool.resolve_sample(images, root=f["data"].parent,
+                            sample_list=tmp_path / "absent.json", strict=True)
+
+
+def test_resolve_sample_no_use_list_says_so(tool, tmp_path: Path):
+    f = _fake_run(tmp_path, n_test_images=8)
+    images = tool.read_split_images(f["data"], "test")
+    mf = tmp_path / "m.json"
+    _write_manifest(images[:5], mf, f["data"].parent)
+    picked, meta = tool.resolve_sample(images, root=f["data"].parent, sample_list=mf,
+                                       sample_n=3, use_list=False)
+    assert meta["source"] == "derived" and len(picked) == 3
+    assert any("--no-sample-list" in w for w in meta["warnings"])
+
+
+def test_cfg_records_sample_defaults(tool, tmp_path: Path, capsys):
+    f = _fake_run(tmp_path)
+    tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+               "--onnx", str(f["onnx"]), "--dry-run"])
+    cfg = _cfg(capsys)
+    # 默认清单是入库的那份：不给参数也应该走固定口径
+    assert Path(cfg["sample_list"]) == tool.REPO_ROOT / "configs" / "bench_sample.json"
+    assert cfg["sample_n"] == 64 and cfg["use_sample_list"] is True
+    assert cfg["sample_list_out"] is None and cfg["strict_sample"] is False
+
+
+def test_cfg_records_sample_flag_overrides(tool, tmp_path: Path, capsys):
+    f = _fake_run(tmp_path)
+    mf, out = tmp_path / "m.json", tmp_path / "o.json"
+    tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+               "--onnx", str(f["onnx"]), "--sample-list", str(mf), "--sample-n", "8",
+               "--sample-list-out", str(out), "--no-sample-list", "--strict-sample",
+               "--dry-run"])
+    cfg = _cfg(capsys)
+    assert Path(cfg["sample_list"]) == mf and cfg["sample_n"] == 8
+    assert Path(cfg["sample_list_out"]) == out
+    assert cfg["use_sample_list"] is False and cfg["strict_sample"] is True
+
+
+def test_dry_run_with_sample_list_out_writes_manifest(tool, tmp_path: Path, capsys):
+    """生成基准清单不该先把两个后端跑一遍，所以 --dry-run 也允许落这一份盘。"""
+    import json
+
+    f = _fake_run(tmp_path, n_test_images=12)
+    out = tmp_path / "configs" / "bench_sample.json"
+    rc = tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+                    "--onnx", str(f["onnx"]), "--sample-n", "4",
+                    "--sample-list-out", str(out), "--dry-run"])
+    text = _stdout(capsys)
+    assert rc == 0 and "未校验" in text and "清单已写入" in text
+    d = json.loads(out.read_text(encoding="utf-8"))
+    images = tool.read_split_images(f["data"], "test")
+    assert d["count"] == 4 and d["source_total"] == 12
+    assert d["files"] == [f"images/test/{q.name}" for q in tool.sample_paths(images, 4)]
+    # 除了清单，别的什么都不该写
+    assert not (tool.REPO_ROOT / "runs" / "segment" / f["run"] / "verify_onnx_fp32.json").exists()
+
+
+def test_dry_run_without_sample_list_out_writes_nothing(tool, tmp_path: Path, capsys):
+    f = _fake_run(tmp_path, n_test_images=5)
+    tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+               "--onnx", str(f["onnx"]), "--dry-run"])
+    assert "清单已写入" not in _stdout(capsys)
+
+
+def test_strict_sample_returns_2_on_split_mismatch(tool, tmp_path: Path, capsys):
+    f = _fake_run(tmp_path, n_test_images=6)
+    images = tool.read_split_images(f["data"], "test")
+    mf = tmp_path / "m.json"
+    _write_manifest(images[:2], mf, f["data"].parent, split="val")
+    rc = tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+                    "--onnx", str(f["onnx"]), "--sample-list", str(mf),
+                    "--strict-sample"])
+    out = _stdout(capsys)
+    assert rc == 2 and "[err  ]" in out and "split=val" in out
+
+
+def test_manifest_too_small_returns_2_with_regeneration_hint(tool, tmp_path: Path, capsys):
+    """清单只有 3 张却要 align 16 张：宁可失败，也不能悄悄改口径。"""
+    f = _fake_run(tmp_path, n_test_images=3)
+    images = tool.read_split_images(f["data"], "test")
+    mf = tmp_path / "m.json"
+    _write_manifest(images, mf, f["data"].parent, source_total=3)
+    rc = tool.main(["--weights", str(f["weights"]), "--data", str(f["data"]),
+                    "--onnx", str(f["onnx"]), "--sample-list", str(mf),
+                    "--align-n", "16", "--bench-n", "30"])
+    out = _stdout(capsys)
+    assert rc == 2
+    assert "清单只有 3 张" in out and "--sample-n 30" in out and "重新生成清单" in out
+
+
+def test_md_renders_manifest_sample_line(tool):
+    layers = {"sample": {"source": "manifest", "path": "configs/bench_sample.json",
+                         "count": 64, "source_total": 435, "sha256": "eccfd964426a2637",
+                         "loaded": 30, "align_n": 16, "bench_n": 30, "warnings": []}}
+    lines = tool._md(layers, MD_CFG)
+    joined = "\n".join(lines)
+    assert "抽样口径：入库清单" in joined
+    assert "configs/bench_sample.json" in joined and "eccfd964426a2637" in joined
+    assert "母体 435 张" in joined and "align 取前 16 张" in joined
+    assert "bench 取前 30 张" in joined
+
+
+def test_md_renders_derived_sample_warning_as_blockquote(tool):
+    layers = {"sample": {"source": "derived", "path": None, "count": 12,
+                         "source_total": 12, "sha256": "0" * 16, "loaded": 12,
+                         "align_n": 16, "bench_n": 0,
+                         "warnings": ["清单不存在：x；改用即时抽样"]}}
+    joined = "\n".join(tool._md(layers, MD_CFG))
+    assert "即时抽样" in joined and "（未落盘）" in joined
+    assert "> 注意：清单不存在" in joined      # 降级在报告里必须显眼
+
+
+def test_md_without_sample_layer_keeps_old_shape(tool):
+    assert len(tool._md({}, MD_CFG)) == 2
+

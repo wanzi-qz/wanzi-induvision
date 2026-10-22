@@ -22,11 +22,26 @@
 前处理统一走 ``induvision/deploy.py``（复刻 ultralytics LetterBox(auto=False) +
 predictor.pre_process），两个后端吃到的输入逐字节相同。
 
+抽样口径是固定的
+----------------
+align 与 bench 用哪几张图，不由 ``--align-n`` / ``--bench-n`` 决定，而由入库的
+``configs/bench_sample.json`` 决定：一条顺序确定的相对路径列表，两层都从它头上切
+（align 前 N 张、bench 前 M 张，共用同一个头）。所以加不加 ``--bench-n`` 都不会换掉
+已经量过的那批图；两轮报告的 ``sha256`` 一样，数字就能直接比。
+
+清单对不上当前数据集（文件缺失 / split 不符 / 图不在）时降级成即时等间距抽样，
+并且**在 stdout、JSON 的 ``sample.source``、Markdown 三处同时留痕**，不会悄悄发生；
+不接受降级就加 ``--strict-sample``。首次生成清单见下面第 0 条命令。
+
 用法
 ----
 .. code-block:: powershell
 
     conda activate induvision
+    # 第 0 层：生成/更新固定抽样清单（只做一次，产物入库）
+    python tools/verify_onnx.py --onnx ... --sample-n 64 \
+        --sample-list-out configs/bench_sample.json --dry-run
+
     # 第 1 层：16 张 test 图逐张量对齐（默认，几十秒）
     python tools/verify_onnx.py --onnx weights/baseline15_fp32.onnx --markdown
 
@@ -57,12 +72,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from induvision.deploy import (  # noqa: E402 - 需要先插好 sys.path
+    DEFAULT_SAMPLE_N,
     compare_tensors,
     latency_stats,
+    load_sample_list,
     preprocess,
     read_image_bgr,
     read_split_images,
+    relative_to_root,
+    sample_fingerprint,
     sample_paths,
+    write_sample_list,
 )
 
 
@@ -126,10 +146,17 @@ def _to_numpy_list(out) -> List[np.ndarray]:
     return []
 
 
-def _load_inputs(paths: Sequence[Path], imgsz: int) -> Tuple[List[np.ndarray], List[str]]:
-    """读图 + 统一前处理，返回 (NCHW float32 列表, 图片名列表)。读不到的图直接跳过。"""
-    xs, names, skipped = [], [], []
-    for p in paths:
+def _load_inputs_indexed(
+    paths: Sequence[Path], imgsz: int
+) -> Tuple[List[np.ndarray], List[str], List[int]]:
+    """读图 + 统一前处理，返回 (NCHW float32 列表, 图片名列表, 每张图在清单里的下标)。
+
+    多返回一个下标不是凑数：读图失败会被跳过，后面按"前 N 张"切 align/bench 时必须
+    按**清单下标**切，不能按存活列表的位置切——否则一张坏图就能让整批图悄悄前移一位，
+    口径变了而报告上看不出来。
+    """
+    xs, names, idx, skipped = [], [], [], []
+    for i, p in enumerate(paths):
         img = read_image_bgr(p)
         if img is None:
             skipped.append(str(p))
@@ -137,9 +164,120 @@ def _load_inputs(paths: Sequence[Path], imgsz: int) -> Tuple[List[np.ndarray], L
         x, _lb = preprocess(img, imgsz=imgsz)
         xs.append(x)
         names.append(p.name)
+        idx.append(i)
     if skipped:
         print(f"[warn ] {len(skipped)} 张图读不出来，已跳过：{', '.join(skipped[:3])}")
+    return xs, names, idx
+
+
+def _load_inputs(paths: Sequence[Path], imgsz: int) -> Tuple[List[np.ndarray], List[str]]:
+    """``_load_inputs_indexed`` 的外壳：只要图和名字，不关心下标。读不到的图直接跳过。"""
+    xs, names, _idx = _load_inputs_indexed(paths, imgsz)
     return xs, names
+
+
+def _take_upto(xs: Sequence[np.ndarray], idx: Sequence[int], limit: int) -> List[np.ndarray]:
+    """按清单下标取前 ``limit`` 张；``limit <= 0`` 返回空列表。"""
+    if limit <= 0:
+        return []
+    return [x for x, i in zip(xs, idx) if i < limit]
+
+
+def resolve_sample(
+    images: Sequence[Path],
+    *,
+    root: Path,
+    sample_list: Optional[Path] = None,
+    sample_n: int = DEFAULT_SAMPLE_N,
+    use_list: bool = True,
+    split: str = "test",
+    strict: bool = False,
+) -> Tuple[List[Path], Dict[str, object]]:
+    """定下"这一轮到底用哪几张图"，并把来源写进 meta。
+
+    清单优先：``sample_list`` 存在且能对上当前数据集，就用它——顺序与内容都是常量，
+    换时间、换命令、加不加 ``--bench-n``，量到的都是同一批图。
+
+    对不上（文件缺失 / split 不符 / 图不在本次 split 里）时按 ``strict`` 决定：
+    ``True`` 直接抛，``False`` 降级成即时等间距抽样。降级不是静默的——原因会进
+    ``meta["warnings"]``，由调用方打到 stdout 并写进 JSON 与 Markdown。
+    """
+    images = list(images)
+    root = Path(root)
+    warnings: List[str] = []
+    lp = Path(sample_list) if sample_list else None
+
+    if not use_list:
+        if lp is not None:
+            warnings.append(f"--no-sample-list：忽略清单 {lp.name}，本轮是即时抽样口径")
+    elif lp is None:
+        warnings.append("未指定清单，本轮是即时抽样口径")
+    elif not lp.is_file():
+        msg = f"清单不存在：{lp}"
+        if strict:
+            raise FileNotFoundError(msg)
+        warnings.append(msg + "；改用即时抽样")
+    else:
+        cand: Optional[List[Path]] = None
+        try:
+            loaded, lm = load_sample_list(lp, root=root, strict=True)
+        except (FileNotFoundError, ValueError) as e:
+            if strict:
+                raise
+            warnings.append(f"清单用不了（{e}）；改用即时抽样")
+        else:
+            if lm.get("split") not in (None, split):
+                msg = f"清单记的 split={lm.get('split')}，本次要的是 {split}"
+                if strict:
+                    raise ValueError(msg)
+                warnings.append(msg + "；改用即时抽样")
+            else:
+                avail = {str(Path(q).resolve()) for q in images}
+                outside = [q for q in loaded if str(Path(q).resolve()) not in avail]
+                if outside:
+                    msg = (f"清单里 {len(outside)}/{len(loaded)} 张不在本次 {split} split 中"
+                           f"（如 {Path(outside[0]).name}）")
+                    if strict:
+                        raise FileNotFoundError(msg)
+                    warnings.append(msg + "；改用即时抽样")
+                else:
+                    cand = loaded
+        if cand is not None:
+            return cand, _sample_meta(
+                "manifest", cand, root, images, sample_n, lp,
+                sha=str(lm.get("sha256") or sample_fingerprint(cand, root)),
+                sampling=lm.get("sampling"), created_utc=lm.get("created_utc"),
+                manifest_git_head=lm.get("git_head"),
+                source_total=lm.get("source_total"), warnings=warnings)
+
+    picked = sample_paths(images, sample_n)
+    return picked, _sample_meta(
+        "derived", picked, root, images, sample_n, lp,
+        sha=sample_fingerprint(picked, root), warnings=warnings)
+
+
+def _sample_meta(source: str, picked: Sequence[Path], root: Path,
+                 images: Sequence[Path], sample_n: int, lp: Optional[Path], *,
+                 sha: str, sampling: Optional[str] = "equidistant",
+                 created_utc: Optional[str] = None,
+                 manifest_git_head: Optional[str] = None,
+                 source_total: Optional[object] = None,
+                 warnings: Optional[List[str]] = None) -> Dict[str, object]:
+    """把"这批图是谁、从哪来"拼成一份可入库的元信息。"""
+    return {
+        "source": source,
+        "path": str(lp) if lp else None,
+        "requested_n": int(sample_n),
+        "count": len(picked),
+        "source_total": len(images) if source_total is None else source_total,
+        "sha256": sha,
+        "sampling": sampling,
+        "created_utc": created_utc,
+        "manifest_git_head": manifest_git_head,
+        "root": str(root),
+        "names": [relative_to_root(q, root) for q in picked],
+        "warnings": list(warnings or []),
+    }
 
 
 def _ort_session(onnx_path: Path, providers: Optional[Sequence[str]] = None):
@@ -345,6 +483,17 @@ def check_val(delta: Optional[float], max_map_delta: float) -> Tuple[bool, List[
 
 def _md(layers: Dict[str, object], cfg: Dict[str, object]) -> List[str]:
     lines: List[str] = [f"**ONNX 对齐校验（run=`{cfg['run']}`，tag=`{cfg['tag']}`）**", ""]
+    s = layers.get("sample")
+    if s:
+        src = "入库清单" if s.get("source") == "manifest" else "即时抽样"
+        lines += [
+            f"抽样口径：{src} `{s.get('path') or '（未落盘）'}`"
+            f"（{s.get('count')} 张 / 母体 {s.get('source_total')} 张，"
+            f"sha256 `{s.get('sha256')}`）；本轮读入 {s.get('loaded')} 张，"
+            f"align 取前 {s.get('align_n')} 张、bench 取前 {s.get('bench_n')} 张", "",
+        ]
+        for wn in s.get("warnings") or []:
+            lines += [f"> 注意：{wn}", ""]
     al = layers.get("align")
     if al:
         lines += [
@@ -403,6 +552,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--name", default=None, help="run 名，默认从权重路径反推")
     ap.add_argument("--tag", default="fp32", help="对应导出时的 tag，只影响默认 onnx 路径与 JSON 文件名")
     ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--sample-list", default="configs/bench_sample.json",
+                    help="固定抽样清单（入库）；align/bench 都从它头上切，保证同一批图")
+    ap.add_argument("--sample-n", type=int, default=DEFAULT_SAMPLE_N,
+                    help="没有可用清单时，从 split 等间距抽多少张当基准")
+    ap.add_argument("--sample-list-out", default=None,
+                    help="把本轮清单另存一份（首次生成 / 更新基准）")
+    ap.add_argument("--no-sample-list", action="store_true",
+                    help="忽略清单强制即时抽样；自检用，数字不可与清单口径互比")
+    ap.add_argument("--strict-sample", action="store_true",
+                    help="清单对不上就直接失败，不降级成即时抽样")
     ap.add_argument("--align-n", type=int, default=16, help="逐张量对齐用几张图")
     ap.add_argument("--align-device", default="cpu", help="对齐时 PyTorch 用的设备；cpu 才能把差异归因到导出本身")
     ap.add_argument("--bench-n", type=int, default=0, help="延迟测量帧数，0 = 跳过第 3 层")
@@ -431,6 +590,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         w = (REPO_ROOT / w).resolve()
     if not d.is_absolute():
         d = (REPO_ROOT / d).resolve()
+    sample_list = Path(args.sample_list) if args.sample_list else None
+    if sample_list is not None and not sample_list.is_absolute():
+        sample_list = (REPO_ROOT / sample_list).resolve()
+    sample_out = Path(args.sample_list_out) if args.sample_list_out else None
+    if sample_out is not None and not sample_out.is_absolute():
+        sample_out = (REPO_ROOT / sample_out).resolve()
 
     run = args.name or (w.parents[1].name if w.parent.name == "weights" else w.stem)
     onnx_path = Path(args.onnx) if args.onnx else (REPO_ROOT / "weights" / f"{run}_{args.tag}.onnx")
@@ -449,6 +614,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "run": run, "tag": args.tag, "imgsz": args.imgsz, "align_n": args.align_n,
         "align_device": args.align_device, "bench_n": args.bench_n,
         "bench_device": args.bench_device, "val": args.val, "val_batch": args.val_batch,
+        "sample_list": str(sample_list) if sample_list else None,
+        "sample_n": args.sample_n, "use_sample_list": not args.no_sample_list,
+        "sample_list_out": str(sample_out) if sample_out else None,
+        "strict_sample": args.strict_sample,
         "val_device": args.val_device, "thresholds": {
             "min_cosine": args.min_cosine, "max_rel_l2": args.max_rel_l2,
             "max_map_delta": args.max_map_delta},
@@ -456,6 +625,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     print("[cfg  ] " + json.dumps(cfg, ensure_ascii=False))
     if args.dry_run:
+        # --dry-run 唯一允许落盘的东西就是清单本身：生成基准不该先把两个后端跑一遍。
+        # 这里刻意 use_list=False——清单要从数据集重新抽，不能拿旧清单当母体。
+        if sample_out:
+            dry_images = read_split_images(d, args.split)
+            if not dry_images:
+                print(f"[err  ] {d} 的 {args.split} split 里没有图片")
+                return 2
+            canon, _m = resolve_sample(dry_images, root=d.parent, sample_n=args.sample_n,
+                                       use_list=False, split=args.split)
+            wm = write_sample_list(canon, sample_out, root=d.parent, split=args.split,
+                                   imgsz=args.imgsz, source_total=len(dry_images),
+                                   git_head=_git_head())
+            print(f"[list ] 清单已写入 {sample_out}（{wm['count']} 张 / 母体 {len(dry_images)} 张，"
+                  f"sha256:{wm['sha256']}）")
         print("[dry  ] 未校验")
         return 0
 
@@ -464,12 +647,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not images:
         print(f"[err  ] {d} 的 {args.split} split 里没有图片")
         return 2
-    picked = sample_paths(images, args.align_n if args.bench_n <= 0 else max(args.align_n, args.bench_n))
-    xs, names = _load_inputs(picked, args.imgsz)
+    need = max(args.align_n, args.bench_n)
+    try:
+        canonical, sample_meta = resolve_sample(
+            images, root=d.parent, sample_list=sample_list, sample_n=args.sample_n,
+            use_list=not args.no_sample_list, split=args.split, strict=args.strict_sample)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[err  ] {e}")
+        return 2
+    for wn in sample_meta["warnings"]:
+        print(f"[warn ] {wn}")
+    if len(canonical) < need and sample_meta["source"] == "manifest":
+        print(f"[err  ] 清单只有 {len(canonical)} 张，撑不起 --align-n {args.align_n} / "
+              f"--bench-n {args.bench_n}；调小参数，或用 --sample-n {need} "
+              f"--sample-list-out 重新生成清单（口径变了就和旧报告不可比）")
+        return 2
+    if len(canonical) < need:
+        print(f"[warn ] {args.split} 只有 {len(canonical)} 张图，少于请求的 {need} 张")
+    picked = canonical[:need]
+    xs, names, idx = _load_inputs_indexed(picked, args.imgsz)
     if not xs:
         print("[err  ] 一张图都没读到，无法校验")
         return 2
-    print(f"[data ] {args.split} 共 {len(images)} 图，取 {len(xs)} 张做对齐/压测")
+    sample_meta["canonical_names"] = sample_meta["names"]
+    sample_meta["names"] = [relative_to_root(q, d.parent) for q in picked]
+    sample_meta.update({"align_n": args.align_n, "bench_n": args.bench_n,
+                        "picked": len(picked), "loaded": len(xs),
+                        "skipped": len(picked) - len(xs)})
+    print(f"[data ] {args.split} 共 {len(images)} 图；口径={sample_meta['source']} "
+          f"{sample_meta['count']} 张（sha256:{sample_meta['sha256']}），本轮读入 {len(xs)} 张")
+    if sample_out:
+        wm = write_sample_list(canonical, sample_out, root=d.parent, split=args.split,
+                               imgsz=args.imgsz, source_total=len(images), git_head=_git_head())
+        print(f"[list ] 清单已写入 {sample_out}（{wm['count']} 张，sha256:{wm['sha256']}）")
 
     from ultralytics import YOLO  # 延迟导入：--dry-run 不需要 torch
 
@@ -479,8 +689,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sess, providers, input_name = _ort_session(onnx_path)
     print(f"[ort  ] providers={providers} input={input_name}")
 
-    layers: Dict[str, object] = {"providers": providers}
-    align_x = xs[:args.align_n]
+    layers: Dict[str, object] = {"providers": providers, "sample": sample_meta}
+    align_x = _take_upto(xs, idx, args.align_n)
     layers["align"] = align_tensors(align_x, net, sess, input_name, args.align_device)
     layers["align"]["providers"] = providers
     a = layers["align"]
@@ -498,7 +708,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[ok   ] 第 1 层通过：两个后端算子层面等价")
 
     if args.bench_n > 0:
-        bench_x = xs[:args.bench_n]
+        bench_x = _take_upto(xs, idx, args.bench_n)
         if len(bench_x) < args.bench_n:
             print(f"[warn ] 只有 {len(bench_x)} 张可用图，少于 --bench-n {args.bench_n}")
         net.to(_torch_device(args.bench_device)).eval()
@@ -537,7 +747,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     payload = {
         "run": run, "tag": args.tag, "weights": str(w), "onnx": str(onnx_path),
         "data": str(d), "split": args.split, "imgsz": args.imgsz,
-        "config": cfg, "images_used": names[:len(xs)],
+        "config": cfg, "sample": sample_meta, "images_used": names,
         "align": a, "bench": layers.get("bench"), "val": layers.get("val"),
         "reference": layers.get("reference"), "verdict": verdict,
         "seconds": round(time.time() - t_start, 1), "git_head": _git_head(),

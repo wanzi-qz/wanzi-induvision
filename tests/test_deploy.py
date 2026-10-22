@@ -308,3 +308,189 @@ def test_read_image_bgr_survives_fromfile_oserror(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(deploy.np, "fromfile", _boom)
     got = deploy.read_image_bgr(p)
     assert got is not None and got.shape == (8, 8, 3)
+
+
+# ------------------------------------------------------------------ 抽样清单
+#
+# 这批测试盯的是一件事：清单必须能在别的机器、别的时间还原出**同一批图**。
+# 只要里面漏进一个绝对路径、或者缺图时静默换一张，两轮报告的数字就不可比，
+# 而报告上看不出来——所以这里连"缺图必须抛"和"文件必须 UTF-8 无 BOM + LF"都断言。
+
+def _mk_images(root: Path, n: int = 12, split: str = "test") -> list:
+    out = []
+    for i in range(n):
+        q = root / "images" / split / f"{i:03d}.png"
+        q.parent.mkdir(parents=True, exist_ok=True)
+        assert cv2.imwrite(str(q), _img(24, 32, seed=i))
+        out.append(q)
+    return sorted(out)
+
+
+def test_default_sample_n_and_version_are_declared():
+    # 清单长度是口径的一部分，改它就等于换口径，必须是有意识的一次改动
+    assert deploy.DEFAULT_SAMPLE_N == 64
+    assert deploy.SAMPLE_LIST_VERSION == 1
+
+
+def test_relative_to_root_is_posix_and_relative(tmp_path: Path):
+    imgs = _mk_images(tmp_path / "ds")
+    rel = deploy.relative_to_root(imgs[0], tmp_path / "ds")
+    assert rel == "images/test/000.png"
+    assert "\\" not in rel and not Path(rel).is_absolute()
+
+
+def test_relative_to_root_outside_root_falls_back_to_absolute(tmp_path: Path):
+    """不在 root 下面的路径不能硬凑成 ../..：读端要靠"是绝对串"认出它不属于这个数据集。"""
+    imgs = _mk_images(tmp_path / "ds")
+    rel = deploy.relative_to_root(imgs[0], tmp_path / "other")
+    assert Path(rel).is_absolute()
+
+
+def test_sample_fingerprint_is_stable_and_order_sensitive(tmp_path: Path):
+    root = tmp_path / "ds"
+    imgs = _mk_images(root, n=8)
+    picked = deploy.sample_paths(imgs, 4)
+    fp = deploy.sample_fingerprint(picked, root)
+    assert fp == deploy.sample_fingerprint(picked, root)          # 同批图同指纹
+    assert len(fp) == 16
+    assert fp != deploy.sample_fingerprint(list(reversed(picked)), root)  # 顺序也是口径
+    assert fp != deploy.sample_fingerprint(picked[:3], root)      # 少一张就得变
+
+
+def test_sample_fingerprint_survives_moving_the_dataset(tmp_path: Path):
+    """指纹只认相对路径：整个数据集换个目录（换盘、换机器）指纹不变，报告才可比。"""
+    a, b = tmp_path / "ds_a", tmp_path / "ds_b"
+    ia, ib = _mk_images(a, n=6), _mk_images(b, n=6)
+    pa, pb = deploy.sample_paths(ia, 3), deploy.sample_paths(ib, 3)
+    assert deploy.sample_fingerprint(pa, a) == deploy.sample_fingerprint(pb, b)
+
+
+def test_write_sample_list_payload_fields(tmp_path: Path):
+    import json
+
+    root = tmp_path / "ds"
+    imgs = _mk_images(root, n=10)
+    picked = deploy.sample_paths(imgs, 4)
+    out = tmp_path / "configs" / "bench_sample.json"
+    meta = deploy.write_sample_list(picked, out, root=root, split="test", imgsz=640,
+                                    source_total=len(imgs), git_head="abc1234")
+    assert out.is_file() and out.parent.name == "configs"     # 父目录自动建
+    assert meta["count"] == 4 and meta["source_total"] == 10
+    assert meta["split"] == "test" and meta["imgsz"] == 640
+    assert meta["sampling"] == "equidistant" and meta["git_head"] == "abc1234"
+    assert meta["sha256"] == deploy.sample_fingerprint(picked, root)
+    assert meta["files"] == [deploy.relative_to_root(q, root) for q in picked]
+    assert meta["created_utc"].endswith("Z")
+    on_disk = json.loads(out.read_text(encoding="utf-8"))
+    assert on_disk["version"] == deploy.SAMPLE_LIST_VERSION
+    assert on_disk["files"] == meta["files"]
+
+
+def test_write_sample_list_defaults_source_total_to_count(tmp_path: Path):
+    root = tmp_path / "ds"
+    picked = deploy.sample_paths(_mk_images(root, n=5), 3)
+    meta = deploy.write_sample_list(picked, tmp_path / "m.json", root=root)
+    assert meta["source_total"] == 3
+
+
+def test_sample_list_file_is_utf8_no_bom_with_lf(tmp_path: Path):
+    """仓库硬约束：入库文本 UTF-8 无 BOM + LF。BOM 会让某些 JSON 解析器直接翻脸。"""
+    root = tmp_path / "ds"
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(deploy.sample_paths(_mk_images(root, n=4), 2), out, root=root)
+    raw = out.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" not in raw
+    assert raw.endswith(b"}\n")
+
+
+def test_load_sample_list_roundtrips_order_and_paths(tmp_path: Path):
+    root = tmp_path / "ds"
+    imgs = _mk_images(root, n=9)
+    picked = deploy.sample_paths(imgs, 5)
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(picked, out, root=root, split="test", source_total=9)
+    back, meta = deploy.load_sample_list(out, root=root)
+    assert [str(q) for q in back] == [str(q) for q in picked]   # 顺序原样回来
+    assert meta["count"] == 5 and meta["missing"] == []
+    assert meta["sha256"] == deploy.sample_fingerprint(picked, root)
+    assert meta["source_total"] == 9 and meta["split"] == "test"
+    assert Path(meta["root"]) == root.resolve()
+
+
+def test_load_sample_list_strict_raises_when_an_image_is_gone(tmp_path: Path):
+    """缺图必须炸，不能悄悄拿别的图顶上——顶上了就等于换了口径。"""
+    root = tmp_path / "ds"
+    picked = deploy.sample_paths(_mk_images(root, n=6), 4)
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(picked, out, root=root)
+    picked[1].unlink()
+    with pytest.raises(FileNotFoundError) as ei:
+        deploy.load_sample_list(out, root=root)
+    assert "1/4" in str(ei.value) and picked[1].name in str(ei.value)
+
+
+def test_load_sample_list_non_strict_reports_missing(tmp_path: Path):
+    root = tmp_path / "ds"
+    picked = deploy.sample_paths(_mk_images(root, n=6), 4)
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(picked, out, root=root)
+    picked[0].unlink()
+    back, meta = deploy.load_sample_list(out, root=root, strict=False)
+    assert len(back) == 4 and len(meta["missing"]) == 1
+
+
+def test_load_sample_list_rejects_unknown_version(tmp_path: Path):
+    import json
+
+    root = tmp_path / "ds"
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(deploy.sample_paths(_mk_images(root, n=3), 2), out, root=root)
+    d = json.loads(out.read_text(encoding="utf-8"))
+    d["version"] = deploy.SAMPLE_LIST_VERSION + 1
+    out.write_text(json.dumps(d), encoding="utf-8")
+    with pytest.raises(ValueError) as ei:
+        deploy.load_sample_list(out, root=root, strict=False)
+    assert "version" in str(ei.value)
+
+
+def test_load_sample_list_rejects_broken_json(tmp_path: Path):
+    out = tmp_path / "m.json"
+    out.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError) as ei:
+        deploy.load_sample_list(out, strict=False)
+    assert "不是合法 JSON" in str(ei.value)
+
+
+def test_load_sample_list_missing_file_raises(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        deploy.load_sample_list(tmp_path / "nope.json", strict=False)
+
+
+def test_load_sample_list_root_override_wins_over_recorded(tmp_path: Path):
+    """同一份清单可以指到另一个数据集目录（比如数据换了盘），显式 root 说了算。"""
+    a, b = tmp_path / "ds_a", tmp_path / "ds_b"
+    ia = _mk_images(a, n=4)
+    _mk_images(b, n=4)
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(deploy.sample_paths(ia, 2), out, root=a)
+    back, meta = deploy.load_sample_list(out, root=b)
+    assert all(str(q).startswith(str(b.resolve())) for q in back)
+    assert all(q.is_file() for q in back) and meta["missing"] == []
+
+
+def test_load_sample_list_falls_back_to_recorded_root(tmp_path: Path, monkeypatch):
+    """不给 root 时用清单里记的那个；相对串按 REPO_ROOT 还原，所以这里把它指到 tmp。"""
+    ds = tmp_path / "ds"
+    imgs = _mk_images(ds, n=4)
+    out = tmp_path / "m.json"
+    deploy.write_sample_list(deploy.sample_paths(imgs, 2), out, root=ds)
+    monkeypatch.setattr(deploy, "REPO_ROOT", tmp_path)
+    import json
+    d = json.loads(out.read_text(encoding="utf-8"))
+    d["root"] = "ds"                      # 改成相对仓库根的写法
+    out.write_text(json.dumps(d), encoding="utf-8")
+    back, meta = deploy.load_sample_list(out)
+    assert [str(q) for q in back] == [str(q) for q in deploy.sample_paths(imgs, 2)]
+    assert Path(meta["root"]) == ds.resolve()
+

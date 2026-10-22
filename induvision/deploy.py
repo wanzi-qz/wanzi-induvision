@@ -21,16 +21,31 @@ numpy/opencv 实现，两边共用同一份，差值才有归因意义。
   （``auto=pt and self.pt``，非 .pt 权重恒为 False），所以复刻它。
 * ``engine/predictor.py: pre_process``：BGR→RGB、HWC→CHW、float32、除 255、
   ``ascontiguousarray``。
+
+抽样口径为什么要落成清单
+------------------------
+前处理统一了，还剩一个能让两次结果对不上的变量：**喂进去的是哪几张图**。
+抽样长度要是跟着 ``--align-n`` / ``--bench-n`` 变，加不加一个参数就会换掉整批图，
+量出来的延迟差里混着"图不一样"这一项，说不清是后端的锅还是抽样的锅。
+所以这里把清单固化成一份入库的 JSON（``configs/bench_sample.json``）：
+一条顺序确定的相对路径列表，align 取前 N 张、bench 取前 M 张，共用同一个头。
+再配一个 ``sha256`` 指纹写进报告，两轮数字能不能直接比，一眼就能看出来。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import yaml
+
+#: 仓库根。清单里记的 ``root`` 是相对它的 POSIX 串，换机器也能还原。
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 __all__ = [
     "PAD_COLOR",
@@ -43,6 +58,13 @@ __all__ = [
     "latency_stats",
     "sample_paths",
     "read_split_images",
+    "REPO_ROOT",
+    "SAMPLE_LIST_VERSION",
+    "DEFAULT_SAMPLE_N",
+    "relative_to_root",
+    "sample_fingerprint",
+    "write_sample_list",
+    "load_sample_list",
 ]
 
 #: ultralytics 默认填充色（灰）。改了它，两边的输入就不再逐字节相同了。
@@ -262,3 +284,132 @@ def read_split_images(data_yaml: Path, split: str = "test") -> List[Path]:
         elif p.is_file():
             out.append(p)
     return sorted(set(out))
+
+
+# --------------------------------------------------------------------------
+# 固定抽样清单
+# --------------------------------------------------------------------------
+
+#: 清单文件格式版本。字段变了就 +1，读端按版本拒收，不去猜旧格式的意思。
+SAMPLE_LIST_VERSION = 1
+
+#: 基准清单默认长度。要喂得起第 1 层（每张图两个后端各跑一遍）和第 3 层（延迟压测），
+#: 又不能长到让一轮校验跑几分钟：64 是折中，也够当 INT8 的校准集。
+DEFAULT_SAMPLE_N = 64
+
+
+def _rel_or_abs(p: Path, base: Path) -> str:
+    """能相对 ``base`` 就写相对 POSIX 串，不能就退回绝对串（读端会当缺图报出来）。"""
+    pp = Path(p).resolve()
+    try:
+        return pp.relative_to(Path(base).resolve()).as_posix()
+    except ValueError:
+        return pp.as_posix()
+
+
+def relative_to_root(p: Path, root: Path) -> str:
+    """把一张图的路径写成相对数据集 ``root`` 的 POSIX 串。
+
+    清单要入库、要在别的机器上还原，里面就绝不能出现绝对路径：盘符、用户名、
+    仓库位置任何一个变了都全废。
+    """
+    return _rel_or_abs(p, root)
+
+
+def sample_fingerprint(paths: Sequence[Path], root: Path) -> str:
+    """抽样清单的指纹：相对路径列表的 ``sha256`` 前 16 位。
+
+    只由路径与**顺序**决定，与机器、时间、绝对路径无关，所以两轮报告指纹相同
+    就意味着数字可以直接相减。刻意不排序：顺序定义了 align/bench 各取前几张，
+    顺序一变口径就变了，指纹必须能反映这件事。
+    """
+    blob = "\n".join(relative_to_root(p, root) for p in paths)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def write_sample_list(
+    paths: Sequence[Path],
+    out: Path,
+    *,
+    root: Path,
+    split: str = "test",
+    imgsz: int = 640,
+    source_total: Optional[int] = None,
+    sampling: str = "equidistant",
+    git_head: Optional[str] = None,
+) -> Dict[str, object]:
+    """把抽样清单落成 JSON（只存相对路径，不存图片），返回写进去的那个 dict。
+
+    ``root`` 能相对仓库根就写相对串，这样清单跟着仓库走；``source_total`` 记下
+    抽样母体有多大，日后数据集扩容了能一眼看出这份清单是旧的。
+    """
+    files = [relative_to_root(p, root) for p in paths]
+    payload: Dict[str, object] = {
+        "version": SAMPLE_LIST_VERSION,
+        "split": split,
+        "imgsz": imgsz,
+        "root": _rel_or_abs(root, REPO_ROOT),
+        "sampling": sampling,
+        "count": len(files),
+        "source_total": source_total if source_total is not None else len(files),
+        "sha256": sample_fingerprint(paths, root),
+        "git_head": git_head,
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "files": files,
+    }
+    o = Path(out)
+    o.parent.mkdir(parents=True, exist_ok=True)
+    o.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                 encoding="utf-8", newline="\n")
+    return payload
+
+
+def load_sample_list(
+    path: Path,
+    *,
+    root: Optional[Path] = None,
+    strict: bool = True,
+) -> Tuple[List[Path], Dict[str, object]]:
+    """读回清单，返回 ``(绝对路径列表, 元信息)``。
+
+    ``root`` 的优先级：调用方显式给的 > 清单里记的（相对串按 ``REPO_ROOT`` 还原）
+    > 清单文件自己所在的目录。
+
+    ``strict=True`` 时缺图直接抛 ``FileNotFoundError``，绝不静默换图——换图就等于
+    换口径，报出来的数字再漂亮也没法和上一轮比。``strict=False`` 用于"先看看能
+    还原多少"的场景，缺的图列在 ``meta["missing"]`` 里交给调用方决定。
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"抽样清单不存在：{p}")
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"抽样清单不是合法 JSON：{p}（{e}）") from e
+    ver = d.get("version")
+    if ver != SAMPLE_LIST_VERSION:
+        raise ValueError(f"{p} 的 version={ver}，本代码只认 {SAMPLE_LIST_VERSION}")
+
+    files = list(d.get("files") or [])
+    if root is None:
+        r = d.get("root")
+        root = Path(str(r)) if r else p.parent
+    root = Path(root)
+    if not root.is_absolute():
+        root = (REPO_ROOT / root).resolve()
+
+    paths = [(root / f) for f in files]
+    missing = [str(q) for q in paths if not q.is_file()]
+    if missing and strict:
+        raise FileNotFoundError(
+            f"{p} 里 {len(missing)}/{len(paths)} 张图不在（root={root}）："
+            + ", ".join(Path(m).name for m in missing[:3])
+        )
+    meta: Dict[str, object] = {
+        "path": str(p), "root": str(root), "split": d.get("split"),
+        "imgsz": d.get("imgsz"), "sampling": d.get("sampling"),
+        "count": len(paths), "source_total": d.get("source_total"),
+        "sha256": d.get("sha256"), "git_head": d.get("git_head"),
+        "created_utc": d.get("created_utc"), "missing": missing,
+    }
+    return paths, meta

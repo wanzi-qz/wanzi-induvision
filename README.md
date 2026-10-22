@@ -10,6 +10,9 @@
 
 [![CI](https://github.com/wanzi-qz/wanzi-induvision/actions/workflows/ci.yml/badge.svg)](https://github.com/wanzi-qz/wanzi-induvision/actions/workflows/ci.yml)
 
+第一次看这个仓库，先读 [docs/overview.md](docs/overview.md)：按 **背景 → 方法 → 结果**
+把整条链路一次讲完。下面这张进度表是它的索引版，每行链到对应的细节文档。
+
 ## 进度
 
 | 阶段 | 内容 | 状态 |
@@ -18,7 +21,7 @@
 | W1a | MVTec 下载校验 + YOLO-seg 转换管线 + 单测 + CI | 完成 → [docs/dataset.md](docs/dataset.md) |
 | W1b | 15 类全量数据 + 基线训练（mAP50-95、单类 AP、混淆矩阵） | 完成 → [docs/baseline.md](docs/baseline.md) §2：15 类 / 5354 图（sha256 全过，转换 27.7 s），baseline15 在 test split 上 mask mAP50-95 **0.3740** / mAP50 0.6730，box 0.4229 / 0.6652，best @ ep75、ep95 早停 |
 | W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 完成（5 组全出数）→ [docs/baseline.md](docs/baseline.md) §3：Copy-Paste 把 mask mAP50-95 从 0.2453 抬到 **0.4071**（+66%），整张复制的过采样 **0.4003** 与它基本打平（差 0.0068），focal 在这个规模上是**负收益**（C1 0.1953，B2 0.0039 直接学崩）。绝对值不可外引（val 仅 29 图 / 16 实例） |
-| W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟） | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass** |
+| W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟）+ 固定抽样清单 | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass**。口径基准 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`），见 §4.0 |
 | W3b | trtexec FP32/FP16/INT8（熵校准，500 张校准集） | 未开始（TensorRT 待装，见 [docs/environment.md](docs/environment.md) §6） |
 | W4 | TensorRT C++ 推理服务：零拷贝 + 三线程流水线 + CMake + 压测报告 | 未开始（工具链待装） |
 
@@ -32,7 +35,7 @@ induvision/          核心库（只依赖 numpy / opencv / pyyaml，CI 能全�
   copy_paste.py          Copy-Paste 贴图与融合（poisson / alpha），标签同步重建
   balance.py             类别不均衡诊断 + 合成配额规划
   focal.py               Focal Loss：给 ultralytics 分类分支换损失，可装可卸（LIFO）
-  deploy.py              部署链路的纯 CPU 基础设施：复刻 ultralytics 前处理口径、张量比差、延迟分位、等间距抽样
+  deploy.py              部署链路的纯 CPU 基础设施：复刻 ultralytics 前处理口径、张量比差、延迟分位、抽样清单读写与指纹
 tools/
   env_check.py           环境与推理链路自检（可选 --export 验 ONNX 导出）
   download_mvtec.py      取数据：官方 zip 手动模式 / HF 镜像自动模式，逐文件 sha256
@@ -41,17 +44,19 @@ tools/
   train_seg.py           训练入口：统一 CLI + 可选 focal 注入 + 配置留档 + 指标摘要
   eval_seg.py            在 test split 上重算成绩 + 逐类 AP 表（best.pt 是 val 选的，不能拿 val 报数）
   export_onnx.py         .pt -> .onnx，导完立刻静态体检（opset / 动态轴 / checker / 算子清单）
-  verify_onnx.py         .pt 与 .onnx 是否等价：逐张量对齐 -> 端到端 mAP -> 单帧延迟，三层各带判据
+  verify_onnx.py         .pt 与 .onnx 是否等价：固定抽样清单 -> 逐张量对齐 -> 端到端 mAP -> 单帧延迟，各层带判据
   summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，校验「单变量协议」与数据集转换环境指纹
   run_ablation_queue.ps1 消融队列（幂等 + 崩溃自动重试）：跑完的组自动跳过，中断的组搬残档后原地重跑
   run_train_guarded.ps1  单组训练守护：等显存 -> 跑 -> 崩了搬残档重试，最多 -MaxAttempts 次
   run_overnight.ps1      串联：补跑消融 -> baseline15 -> test 评测 -> 汇总表，一次挂上不用守
   run_download_mvtec.ps1 后台拉全量数据（脱离宿主 shell，日志落 runs/logs/）
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
-tests/               353 条 pytest，纯 CPU、不联网、不需要真实数据集
-docs/                environment.md 环境 / dataset.md 数据与协议
+configs/             入库的配置：bench_sample.json 固定抽样清单（部署校验的口径基准，带 sha256 指纹）
+tests/               391 条 pytest，纯 CPU、不联网、不需要真实数据集
+docs/                overview.md 项目说明（背景 / 方法 / 结果，先看这个）
+                     environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
-                     deploy.md 部署链路（ONNX 导出与三层精度对齐）
+                     deploy.md 部署链路（ONNX 导出、三层精度对齐与固定抽样口径）
 requirements-gpu.txt 本地 GPU 环境（钉版本）
 requirements-ci.txt  CI 最小依赖（刻意不含 torch）
 data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"
@@ -98,12 +103,15 @@ python tools/eval_seg.py --weights runs/segment/baseline/weights/best.pt `
 
 # 7) 部署链路：导出 ONNX，再验一遍「换后端没换语义」（逐张量 / 端到端 mAP / 延迟）
 python tools/export_onnx.py --weights runs/segment/baseline15/weights/best.pt --markdown
+# 7a) 抽样口径基准只做一次，产物入库（仓库里已有一份，别重复生成，否则和历史报告不可比）
+python tools/verify_onnx.py --sample-n 64 --sample-list-out configs/bench_sample.json --dry-run
 python tools/verify_onnx.py --weights runs/segment/baseline15/weights/best.pt `
-     --val --val-batch 8 --bench-n 30 --markdown
-# 三层全跑 84 s（端到端那层在 CPU 上最慢）。只看配置不写盘加 --dry-run
-# 前处理复刻口径、三条判据与四个踩坑记录见 docs/deploy.md
+     --align-n 16 --bench-n 30 --val --val-batch 8 --markdown
+# 三层全跑 81.5 s（端到端那层在 CPU 上最慢）。只看配置不写盘加 --dry-run
+# 清单在就用清单，对不上就降级并在 stdout / JSON / Markdown 三处留痕；不接受降级加 --strict-sample
+# 前处理复刻口径、三条判据、固定抽样清单与踩坑记录见 docs/deploy.md
 
-# 8) 单测（353 条，约 17 秒；base 环境没装 torch/onnx 会自动跳 6 条）
+# 8) 单测（391 条，约 18 秒；base 环境没装 torch/onnx 会自动跳 6 条）
 python -m pytest -q
 ```
 
@@ -188,20 +196,25 @@ W2 合成管线实测（bottle + toothbrush，seed=0 / cap-factor=2 / workers=4�
 [docs/augmentation.md](docs/augmentation.md)。
 训练结果（含 15 类全量基线与消融）见 [docs/baseline.md](docs/baseline.md)。
 
-W3 部署链路实测（2026-10-22，git de6060b，RTX 4060 Laptop 8GB）：
+W3 部署链路实测（2026-10-22，RTX 4060 Laptop 8GB；抽样口径 = 入库清单，sha256 `eccfd964426a2637`）：
 
 | 项 | 值 |
 | --- | --- |
 | ONNX 导出 | `baseline15_fp32.onnx` **45.53 MB**，opset 17 / IR 8，动态 batch，357 节点 22 算子，checker 通过，8.2 s |
-| 第 1 层 逐张量对齐 | 16 张 test 图，PyTorch(cpu) vs ONNX Runtime：`output0` rel_l2 **2.4e-7** / cosine **1.00000000**，`output1` rel_l2 1.61e-6 / cosine 1.00000000，8.6 s |
-| 第 2 层 端到端 mAP | test 435 图重算：mask mAP50-95 0.3740 → **0.3741**（+0.0001），box 0.4229 → 0.4228，68.2 s |
-| 第 3 层 单帧延迟 | batch=1 / 640 / 30 帧：ORT(CPU) mean 98.14 ms · p95 102.25 · 10.19 FPS；PyTorch(cuda:0) mean 16.08 ms · p95 18.37 · 62.20 FPS |
-| verdict | **pass**，三层全跑 84.0 s，落 `runs/segment/baseline15/verify_onnx_fp32.json`（不入库） |
-| 测试规模 | 270 → **353** 条 pytest（W3 新增 83 条：deploy 35 / export 11+4skip / verify 37） |
+| 抽样口径 | `configs/bench_sample.json`，64 张 / 母体 435，覆盖全部 15 类；align 取前 16、bench 取前 30，共用同一个头 |
+| 第 1 层 逐张量对齐 | 16 张 test 图，PyTorch(cpu) vs ONNX Runtime：`output0` rel_l2 **2.4e-7** / cosine **1.00000000**，`output1` rel_l2 1.3e-6 / cosine 1.00000000，8.6 s |
+| 第 2 层 端到端 mAP | test 435 图重算（整份，与清单无关）：mask mAP50-95 0.3740 → **0.3741**（+0.0001），box 0.4229 → 0.4228，63.9 s |
+| 第 3 层 单帧延迟 | batch=1 / 640 / 30 帧：ORT(CPU) mean 94.58 ms · p95 99.59 · 10.57 FPS；PyTorch(cuda:0) mean 13.13 ms · p95 15.91 · 76.17 FPS |
+| verdict | **pass**，三层全跑 81.5 s，落 `runs/segment/baseline15/verify_onnx_fp32.json`（不入库） |
+| 测试规模 | 270 → **391** 条 pytest（W3 新增 121 条：deploy 51 / export 11+4skip / verify 59） |
 
 ORT 那行慢是**设备差不是后端差**：本机装的是 onnxruntime CPU 版，providers 里没有
-CUDAExecutionProvider，这组数字是留给 TensorRT 三档量化当同机基线的。
-完整口径、读数提醒与踩坑记录见 [docs/deploy.md](docs/deploy.md)。
+CUDAExecutionProvider（只有 `AzureExecutionProvider, CPUExecutionProvider`），
+这组数字是留给 TensorRT 三档量化当同机基线的。
+
+表里是**固定清单口径**这一轮。生成清单之前那轮（第 3 层 ORT mean 98.14 ms / PyTorch 16.08 ms）
+用的不是同一批图，两轮数字不可直接相减 —— 为什么要固定、固定成什么样，见
+[docs/deploy.md](docs/deploy.md) §4.0；完整口径、读数提醒与踩坑记录同见该文。
 
 ## 许可与入库边界
 
