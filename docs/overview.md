@@ -121,12 +121,18 @@ verdict **pass**。原计划用 `trtexec`，但本机根本没有 `trtexec.exe` 
 
 ### W4 拆两步
 
-1. **Python 侧先把工程要点做出来并可测**（不依赖 C++ 工具链）：pinned memory 零拷贝 + 异步 H2D/D2H、
-   解码 / 推理 / 后处理三线程流水线 + 环形队列，NMS 与掩码解码落到 numpy/torch，
-   用同一份 30 张清单量吞吐，和 §3.3b 的单帧延迟对照，直接产出"较单线程提升 N×"的数；
-2. **C++ 版**：TensorRT C++ API（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 → 后处理）
-   + CMake 工程 + 500 张端到端 P50/P95 压测。本机实测 `nvcc` / `cmake` / `cl` / `ninja` / `msbuild`
-   全部 not found，也没有 CUDA Toolkit 与 VS 安装目录，得先装 VS Build Tools + CUDA Toolkit（数 GB）。
+**① Python 侧流水线：已完成**（`induvision/pipeline.py` + `pinned.py`，入口 `tools/bench_pipeline.py`）。
+pinned memory 零拷贝 + 异步 H2D/D2H、解码 / 推理 / 后处理三线程流水线 + 自研环形队列、
+NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清单 × 10 轮 = 300 帧量吞吐。
+含磁盘读图的真实口径 **1.44~1.71×**，隔离磁盘后 **1.19~1.42×**、INT8 档 **330 FPS**；
+与 ultralytics 对拍 match_rate 1.0000 / 框 IoU 1.0000 / 掩码 IoU 0.910~0.916，三档 10 条判据全过。
+细节、掩码解码那个 bug 的完整排查、以及「util ≈0.99 不等于算力打满」这个读数陷阱见 [pipeline.md](pipeline.md)。
+
+**② C++ 版：待做**。TensorRT C++ API（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 → 后处理）
++ CMake 工程 + 500 张端到端 P50/P95 压测。本机实测 `nvcc` / `cmake` / `cl` / `ninja` / `msbuild`
+全部 not found，也没有 CUDA Toolkit 与 VS 安装目录，得先装 VS Build Tools + CUDA Toolkit（数 GB）。
+①的实测把 ② 的方向钉住了：含磁盘那轮的瓶颈是 **16~19 ms 的 CPU 前处理**（GPU 已能完全藏进去），
+所以 C++ 版真正要搬上 GPU 的是 letterbox，不是 NMS。
 
 ---
 
@@ -195,12 +201,30 @@ verdict **pass**；三档构建 456.9 s，压测 78.9 s；校准集 train split 
 同轮内排序两轮一致）；**构建本身不确定**（单跑 INT8 166 层 / 12.53 MiB，三档连跑 168 层 / 12.55 MiB，
 比对看 `engine_sha256`）；**TF32 不是链路错**（`--no-tf32` 对照档 rel_l2 2.5e-7，见 [deploy.md](deploy.md) §8.4）。
 
+### 3.3c W4① 推理流水线（同机同轮，300 帧 = 30 张 × 10 轮）
+
+| 组 | 口径 | fp32 | fp16 | int8 |
+| --- | --- | --- | --- | --- |
+| A | 含磁盘读图（**对外报数用这组**） | 36.86 → **57.53** FPS（1.561×） | 34.55 → **55.82**（1.616×） | 33.12 → **51.77**（1.563×） |
+| B | preload 隔离磁盘 | 126.36 → **158.95**（1.258×） | 215.46 → **305.52**（1.418×） | 233.61 → **330.05**（1.413×） |
+
+（pinned 缓冲、串行 → 流水线；plain 缓冲的加速比 A 组 1.441 / 1.642 / 1.705×，B 组 1.186 / 1.391 / 1.178×。）
+常驻显存 18.893 MiB + pinned 主机 18.893 MiB，整轮 630 次 forward 不抖动；
+对拍 ultralytics：match_rate 1.0000（最低也是 1.0000）、框 IoU 1.0000、掩码 IoU 0.9100 / 0.9104 / 0.9158、
+`|分数差|` 0.00000、未全配的图 0 张；三档 10 条判据全过，总结论 **pass**（A 组 92.2 s、B 组 27.0 s）。
+
+两组数要分开读：**A 组的瓶颈是 CPU 前处理**（decode 16~19 ms，infer util 只有 0.33~0.46，
+GPU 三分之二时间在等图），所以流水线能把 GPU 那段整个藏进去，1.5~1.7×；
+**B 组拿掉磁盘后加速比降到 1.2~1.4×**，但 pinned 对 plain 的优势显出来了（int8 330 vs 263 FPS，+25%）——
+省的就是每帧 4.7 MiB 的 H2D 与输出 D2H。加速比的分母一律是**同一轮同机同批**的 `run_serial`，
+不是 §3.3b 的单帧延迟（那组输入常驻显存、不含拷贝与前后处理，两个口径相除得到的倍数没有物理意义）。
+
 ### 3.4 工程
 
 | 项 | 值 |
 | --- | --- |
-| 单测 | **563 条 pytest**（W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62），纯 CPU、不联网、不需要真实数据集、也不需要装 tensorrt（`import tensorrt` 全延迟到函数内），base 环境 19.7 s |
-| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件在 CI 里全量跑 |
+| 单测 | **790 条 pytest**（W4① 新增 227 条：pipeline 168 / pinned 59；W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62），纯 CPU、不联网、不需要真实数据集、也不需要装 tensorrt 与 torch（`import tensorrt` / `import torch` 全延迟到函数内，pinned 那 59 条用注入的假对象覆盖），base 环境 18.3 s |
+| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件与 W4① 新增的 2 个在 CI 里全量跑（本地用 `_cishim` 模拟无 torch 环境实测：pipeline + pinned 226 passed / 1 skipped） |
 | 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 | 入库边界 | CI 断言守着：`git ls-files` 出现 `data/`、`weights/`、`out/`、`runs/` 或任何 `.pt/.onnx/.engine/.trt` 就失败 |
 
@@ -224,5 +248,6 @@ verdict **pass**；三档构建 456.9 s，压测 78.9 s；校准集 train split 
 | 数据集下载 / 转换 / 划分口径 | [dataset.md](dataset.md) |
 | 训练记录、15 类基线、逐类 AP | [baseline.md](baseline.md) |
 | Copy-Paste 合成与 focal 消融全过程 | [augmentation.md](augmentation.md) |
-| ONNX 导出、三层校验、固定抽样清单 | [deploy.md](deploy.md) |
+| ONNX 导出、三层校验、固定抽样清单、三档量化 | [deploy.md](deploy.md) |
+| 流水线结构、令牌缓冲池、掩码解码 bug、吞吐实测 | [pipeline.md](pipeline.md) |
 | 怎么把整条链路跑起来 | [../README.md](../README.md) 的「快速开始」 |

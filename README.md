@@ -23,7 +23,7 @@
 | W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 完成（5 组全出数）→ [docs/baseline.md](docs/baseline.md) §3：Copy-Paste 把 mask mAP50-95 从 0.2453 抬到 **0.4071**（+66%），整张复制的过采样 **0.4003** 与它基本打平（差 0.0068），focal 在这个规模上是**负收益**（C1 0.1953，B2 0.0039 直接学崩）。绝对值不可外引（val 仅 29 图 / 16 实例） |
 | W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟）+ 固定抽样清单 | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass**。口径基准 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`），见 §4.0 |
 | W3b | TensorRT 三档量化 FP32/FP16/INT8（minmax 校准，500 张校准集）+ 三层压测 | 完成 → [docs/deploy.md](docs/deploy.md) §8：INT8 **12.55 MiB**（较 FP32 档 5.2× 压缩）/ 5.77 ms / **173 FPS**（较同场 PyTorch `.pt` **2.41×**），mask mAP50-95 0.3707 → 0.3649（-0.0058，判据 ≤0.03 只用掉 19%），三档 verdict **pass**。踩坑：TensorRT 默认开 TF32，"FP32 档"逐张量 rel_l2 3.3e-3 卡不过判据，`--no-tf32` 才降到 2.5e-7（§8.4） |
-| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | 拆两步（[docs/deploy.md](docs/deploy.md) §8.10）：① Python 侧流水线原型待做，不依赖 C++ 工具链；② C++ 版 + CMake 等 VS Build Tools / CUDA Toolkit —— 本机实测 `nvcc`、`cmake`、`cl`、`ninja`、`msbuild` 全缺 |
+| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | ①完成 → [docs/pipeline.md](docs/pipeline.md)：三档 × {plain,pinned} × {串行,流水线} 全组合实测，A 组含磁盘 **1.44~1.71×**（INT8 51.77 FPS）、B 组 preload **1.19~1.42×**（INT8 **330 FPS**）；与 ultralytics 对拍 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.910~0.916，三档 verdict **pass**。② C++ 版待装 VS Build Tools + CUDA Toolkit —— 本机实测 `nvcc`、`cmake`、`cl`、`ninja`、`msbuild` 全缺（[docs/deploy.md](docs/deploy.md) §8.10） |
 
 ## 仓库结构
 
@@ -37,6 +37,8 @@ induvision/          核心库（只依赖 numpy / opencv / pyyaml，CI 能全�
   focal.py               Focal Loss：给 ultralytics 分类分支换损失，可装可卸（LIFO）
   deploy.py              部署链路的纯 CPU 基础设施：复刻 ultralytics 前处理口径、张量比差、延迟分位、抽样清单读写与指纹
   trt_infer.py           TensorRT 运行期：engine 读写（带 ultralytics 风格 metadata header）、device_memory、TrtRunner
+  pipeline.py            三阶段流水线：RingBuffer 环形队列 + 解码/推理/后处理三线程 + 自研 NMS 与掩码解码
+  pinned.py              pinned memory 令牌池：零拷贝 H2D/D2H，每帧只 stream.synchronize() 一次
 tools/
   env_check.py           环境与推理链路自检（可选 --export 验 ONNX 导出）
   download_mvtec.py      取数据：官方 zip 手动模式 / HF 镜像自动模式，逐文件 sha256
@@ -49,6 +51,7 @@ tools/
   make_calib_list.py     INT8 校准清单：只从 train split 等间距抽，带 sha256 指纹与逐类覆盖统计（拒绝 val/test）
   build_trt.py           .onnx -> TensorRT engine：三档精度、minmax 校准器、头精度配方、--no-tf32 对照档
   bench_trt.py           三档压测：逐张量对齐 / 端到端 mAP / 单帧延迟 + PyTorch 同场对照，各层带判据与 verdict
+  bench_pipeline.py      流水线压测：三档 × {plain,pinned} × {串行,流水线} 全组合，顺带和 ultralytics 参照实现对拍
   summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，校验「单变量协议」与数据集转换环境指纹
   run_ablation_queue.ps1 消融队列（幂等 + 崩溃自动重试）：跑完的组自动跳过，中断的组搬残档后原地重跑
   run_train_guarded.ps1  单组训练守护：等显存 -> 跑 -> 崩了搬残档重试，最多 -MaxAttempts 次
@@ -57,11 +60,12 @@ tools/
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
 configs/             入库的配置：bench_sample.json 固定抽样清单（部署校验的口径基准）、
                      calib_sample.json INT8 校准清单（train split 500 张），都带 sha256 指纹
-tests/               563 条 pytest，纯 CPU、不联网、不需要真实数据集
+tests/               790 条 pytest，纯 CPU、不联网、不需要真实数据集
 docs/                overview.md 项目说明（背景 / 方法 / 结果，先看这个）
                      environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
                      deploy.md 部署链路（ONNX 导出、三层精度对齐与固定抽样口径）
+                     pipeline.md 推理流水线（pinned 令牌池 / 三线程 / 与串行结果对拍）
 requirements-gpu.txt 本地 GPU 环境（钉版本）
 requirements-ci.txt  CI 最小依赖（刻意不含 torch）
 data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"
@@ -124,7 +128,14 @@ python tools/bench_trt.py --val --markdown           # 三层压测 78.9 s，出
 # 想看关掉 TF32 的真 FP32 对照档：build_trt.py --name x --prec fp32 --no-tf32
 # 三档实测数字、TF32 排查、INT8 连挂四次的根因见 docs/deploy.md §8
 
-# 8) 单测（563 条，约 20 秒；base 环境没装 torch/onnx 会自动跳 6 条）
+# 7c) 推理流水线压测（同样要 GPU + tensorrt）：三档 × {plain,pinned} × {串行,流水线} 全组合
+python tools/bench_pipeline.py --check-ultralytics --markdown            # A 组含磁盘，92.2 s
+python tools/bench_pipeline.py --preload --check-ultralytics --markdown  # B 组 preload，27.0 s
+# 对外报数用 A 组（含读盘的真实口径）：INT8 51.77 FPS，较同档串行 1.563x
+# B 组是把图先读进内存、只量推理链路的上限：INT8 330.05 FPS（1.413x）
+# 两组数字别混着读，为什么见 docs/pipeline.md §5
+
+# 8) 单测（790 条，约 18 秒；base 环境没装 torch/onnx 会自动跳 6 条）
 python -m pytest -q
 ```
 
@@ -252,6 +263,31 @@ verdict **pass**，三层判据全过；INT8 的掉点判据是 ≤0.03，实测
 
 测试规模 391 → **563** 条 pytest（W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62）。
 这 172 条一条都不需要装 tensorrt —— `import tensorrt` 全延迟到函数内，CI 只跑逻辑不跑 GPU。
+
+W4① 推理流水线实测（2026-10-23，同一台机器同一轮；30 帧 = 入库清单头部，`--repeats 10` → 每组 300 帧）：
+
+| 组 | 口径 | FP32 | FP16 | INT8 | 瓶颈阶段 |
+| --- | --- | --- | --- | --- | --- |
+| A 含磁盘 | 读盘+解码+推理+后处理全链路，**对外报数用这组** | 36.86 → **57.53** FPS（1.561×） | 34.55 → **55.82**（1.616×） | 33.12 → **51.77**（1.563×） | decode（util 1.00） |
+| B preload | 图先常驻内存，只量推理链路上限 | 126.36 → **158.95**（1.258×） | 215.46 → **305.52**（1.418×） | 233.61 → **330.05**（1.413×） | decode / infer 打平 |
+
+箭头左边是同档**串行单帧**、右边是 **pinned + 三线程流水线**，加速比只在同档同组内成立。
+A 组里 pinned 与 plain 基本打平（fp32 两者流水线都是 57.53 FPS；plain 的加速比 1.441× / 1.642× /
+1.705× 忽高忽低，是因为分母——它自己的串行基线——变了，不是因为流水线更快）。
+瓶颈是 16~19 ms 的读图 + letterbox，拷贝那点开销藏在它后面，**pinned 的账要到 B 组才算得出来**：
+INT8 流水线 330.05 vs plain 263.20（**+25%**），省下的正是每帧新建可分页缓冲的那次同步拷贝。
+两组口径与这笔账见 [docs/pipeline.md](docs/pipeline.md) §5 / §6.1 / §6.2。
+
+与 ultralytics 参照实现对拍（同图同阈值，FP32/FP16 13/13、INT8 17/17 检出全部配上）：
+match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.9100~0.9158（判据 0.85），三档各 10/10 条判据
+全过、verdict **pass**。掩码那 0.09 的差不是随机噪声：第一版把 proto mask 按框尺寸拉伸是错的
+（9×9 小框 IoU 只有 0.5625，框越大越看不出来），修法与面积扫描验证见
+[docs/pipeline.md](docs/pipeline.md) §4.2。常驻显存与 pinned 主机内存各 **18.893 MiB**
+（pool_size 2；调到 3/4/6 吞吐几乎不动，见 §7）。
+
+测试规模 563 → **790** 条 pytest（W4① 新增 227 条：pipeline 168 / pinned 59）。
+这 227 条一条都不碰 GPU —— 环形队列、令牌池、CUDA 流全用假对象测，
+连"每帧只 synchronize 一次""出错要把令牌还回池子"都是断言出来的。
 
 ## 许可与入库边界
 
