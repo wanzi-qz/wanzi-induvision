@@ -113,8 +113,28 @@ CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 Py
 
 ## 7. 已知注意事项
 
-1. **github.com:443 间歇性不通**（本次直连失败 2 次）。下载 release 资产走
-   `https://gh-proxy.com/<原始 github 链接>`，本次 22.8 MB 权重 3.6 秒下完。
+1. **github.com:443 时通时不通**。下载 release 资产走 `https://gh-proxy.com/<原始 github 链接>`，
+   本次 22.8 MB 权重 3.6 秒下完。`git push` 也会中招，2026-10-23 00:14 复现过一次硬失败：
+   DNS 把 `github.com` 解析到 `20.205.243.166`，ping 通但 TCP 443 不通，`git push` 连试 6 次全是
+   `Failed to connect to github.com:443`。排查与绕法（照抄可用）：
+
+   ```powershell
+   # 1) 先确认不是本机断网：这条通，说明只有上面那个 IP 被卡
+   Test-NetConnection www.baidu.com -Port 443 -InformationLevel Quiet
+   # 2) 兄弟域名解析出的 IP 是通的 -> 问题在 DNS 给的这一个地址，不在链路
+   Test-NetConnection codeload.github.com -Port 443 -InformationLevel Quiet
+   # 3) 用 curloptResolve 把域名钉到一个能连的 GitHub IP（下列 4 个本机实测均可连）
+   #    140.82.112.3 / 140.82.113.3 / 140.82.114.4 / 20.27.177.113
+   git -c http.https://github.com/.curloptResolve="github.com:443:140.82.112.3" push origin master
+   # 4) 想长期生效（写进 .git/config，只影响本仓库，不进版本库）
+   git config --local http.https://github.com/.curloptResolve "github.com:443:140.82.112.3"
+   # 5) 这个 IP 哪天失效了：换上面另一个，或删掉配置恢复默认 DNS
+   git config --local --unset http.https://github.com/.curloptResolve
+   ```
+
+   本仓库已按第 4 步设了 local 配置，所以直接 `git push` 就能过。
+   注：本机系统代理（`127.0.0.1:7897`）当时是关着的，git 也没配 `http.proxy`，
+   所以别急着往代理方向查，先量端口。
 2. pip 一律加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`，实测延迟 209 ms。
 3. **不要用 `pip install torch` 升级本环境的 torch**：PyPI 默认是 CPU 版，会把 cu130 覆盖掉，
    `cuda.is_available()` 立刻变 False。
