@@ -415,7 +415,8 @@ def test_calibrator_write_cache_creates_parent(tmp_path: Path):
 
 
 def test_calibrator_get_batch_exhausts_then_none(tmp_path: Path, monkeypatch):
-    import torch
+    # 校准器要拿真实张量的 data_ptr()，没 torch 就只能跳过（CI 刻意不装 torch）
+    torch = pytest.importorskip("torch")
 
     calls: list[int] = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: calls.append(1))
@@ -428,7 +429,7 @@ def test_calibrator_get_batch_exhausts_then_none(tmp_path: Path, monkeypatch):
 
 def test_calibrator_holds_current_tensor_until_next_batch(tmp_path: Path, monkeypatch):
     """返回裸指针，张量必须一直挂在 self._cur 上；否则 TRT 读到的是回收的显存。"""
-    import torch
+    torch = pytest.importorskip("torch")
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     c = make_calib(tmp_path, n_batches=3)

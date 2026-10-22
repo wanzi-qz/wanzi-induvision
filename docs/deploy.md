@@ -301,7 +301,15 @@ sha256 `eccfd964426a2637` 这一份清单（`--align-n 16 --bench-n 30 --val --v
 不需要真实数据集，19.7 s）。W3b 新增 172 条：trt_infer 36 / make_calib_list 24 /
 build_trt 50 / bench_trt 62。**这些测试都不需要装 tensorrt** —— `build_trt` / `bench_trt`
 里的 `import tensorrt` 全部延迟到函数内，CI 只跑逻辑不跑 GPU。
-CI 里那 6 条 skip = 4 条要 onnx + 原有 2 条。
+CI 里的 skip = 要 onnx 的 4 条 + 要 torch 的（校准器那 2 条 + 原有 2 条）。
+
+记一条 CI 抓出来的测试写法问题，因为它在本机**永远不会红**：新增那条
+`--max-rel-l2` 收紧判据的测试忘了传 `base_args`，`main()` 就落到仓库默认路径
+`weights/baseline15_trt_fp32.engine`。本机那份真 engine 在，dry-run 返回 0，测试通过；
+CI 上没有 engine，返回 2，四个 job 一起红。**本机有真产物 = 忘传参数的测试会假装通过**，
+所以 CLI 类测试一律显式传 `--weights/--data/--engine-dir` 指向 tmp_path 里的假文件。
+复现 CI 的无 torch 环境也有个便宜办法：建一个 `_cishim/torch/__init__.py`
+里面 `raise ImportError`，`PYTHONPATH=_cishim pytest` 就能本地验 skip 分支。
 
 ## 8. W3b 三档量化实测（TensorRT 10.16.1.11）
 

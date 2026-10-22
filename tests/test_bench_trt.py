@@ -53,8 +53,14 @@ def test_thresholds_fp32_fp16_match_their_numeric_format():
 
 
 def test_rel_l2_threshold_still_admits_tightening_via_cli(bench_env, capsys):
-    """放宽默认值不等于把这条判据废掉：--max-rel-l2 仍能收紧到真 FP32 那一档。"""
-    rc = bn.main(["--precs", "fp32", "--max-rel-l2", "1e-5", "--dry-run"])
+    """放宽默认值不等于把这条判据废掉：--max-rel-l2 仍能收紧到真 FP32 那一档。
+
+    必须走 ``base_args``：不带 ``--weights/--data/--engine-dir`` 时会落到仓库默认路径
+    ``weights/baseline15_trt_fp32.engine``，本机那份真 engine 在，测试就"假装"通过了；
+    CI 上没有 engine，返回 2 —— 这条就是这么被 ubuntu/windows 四个 job 一起抓出来的。
+    """
+    w, data, edir = bench_env
+    rc = bn.main(base_args(w, data, edir, "--precs", "fp32", "--max-rel-l2", "1e-5", "--dry-run"))
     out = capsys.readouterr().out
     assert rc == 0
     assert "1e-05" in out or "1e-5" in out
