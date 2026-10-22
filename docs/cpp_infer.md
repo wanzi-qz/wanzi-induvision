@@ -1,12 +1,19 @@
 # W4② C++ 推理服务：施工单
 
-一句话：**现在写不了，本机缺四样东西**（MSVC / CMake+Ninja / CUDA 头与 import lib / TensorRT 头与 import lib）。
+一句话：**现在还写不了，本机缺三样**（MSVC 编译器 / CUDA 头与 import lib / TensorRT 的 import lib）。
+原来缺五样，今晚已经补掉两样：**CMake + Ninja 装好了**（§2 S1），**TensorRT 头文件也拉下来了**（§2 S4）。
 这份文档把"缺什么、怎么装、装完做什么、拿什么判据验收"钉死，工具链到位当天可以照着走，不用再调研一遍。
+
+另外 §7 / §8 是**不需要编译器就能先做掉的部分**，已经做完了：三个 engine 的 I/O 契约（tensor 名 / shape /
+dtype / 激活内存）逐个问出来了，计划要用的 TensorRT C++ 符号也在 v10.16 的头里逐个核对过。
+顺手踩到一个会让下次开工白绕一圈的坑：**`.engine` 文件前面有 844 字节的 ultralytics 头，不是裸流**（§7.1）。
 
 **实测与计划的边界**（本仓库的老规矩，不混着写）：
 
 - 实测：§1 全部（每条给命令）、§2 里的 winget 包 ID 与版本号、TensorRT GitHub `v10.16` tag 与
-  `include/` 的 14 个头文件、pip `tensorrt_libs` 里 **11 个 DLL / 0 个 `.lib`**、torch 自带 `cudart64_13.dll`。
+  `include/` 的 14 个头文件（**已克隆到 `_vendor\`**）、pip `tensorrt_libs` 里 **11 个 DLL / 0 个 `.lib`**、
+  torch 自带 `cudart64_13.dll`、**§7 的 engine I/O 契约与激活内存**（三个 engine 逐个 tensor 问出来的）、
+  **§8 的 API 核对**（逐个符号 grep 头文件，带行号）。
 - 计划 / 未验证：§2 S5(b) 从 DLL 合成 import lib 的做法、所有体积与耗时估算、conda 装 CUDA 头的备选路径。
   未验证的部分在正文里都单独标了。
 
@@ -17,7 +24,7 @@
 | 组件 | 检查命令 | 结果 | 结论 |
 | --- | --- | --- | --- |
 | MSVC / VS | `Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"` | `False`；`C:\Program Files*\Microsoft Visual Studio` 目录不存在 | **缺**，没有 `cl.exe` 就没有 C++ |
-| CMake / Ninja | `where.exe cmake ninja`；`Test-Path W:\Anaconda\Library\bin\cmake.exe` | 全部 `False` | **缺** |
+| CMake / Ninja | `where.exe cmake ninja`；`Test-Path W:\Anaconda\Library\bin\cmake.exe` | 全部 `False` | 当时缺，**06:18 已装好**（§2 S1） |
 | CUDA Toolkit | `Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"` | 目录不存在 | **缺**（没有 `nvcc`，也没有 `cuda_runtime.h`） |
 | CUDA 头文件 | 在 `W:\Anaconda\envs\induvision` 下递归搜 `cuda_runtime.h` | 0 命中 | **缺** |
 | CUDA 运行时 | `Get-ChildItem ...\torch\lib -Filter cu*.dll` | `cudart64_13.dll` 0.40 MB 在 | **不缺** —— torch 把 CUDA 13 运行时带进来了 |
@@ -37,14 +44,19 @@
 
 ## 2. 安装清单（按顺序，S1 最轻，S2/S3 是大头）
 
-### S1 CMake + Ninja（不用管理员，先装，两分钟）
+### S1 CMake + Ninja —— **已完成（2026-10-23 06:18 实测）**
+
+走的是最轻的一条：pip 的 `cmake` / `ninja` wheel（零依赖，不动 conda 的包图，不需要管理员），
+16 秒装完，落在 `W:\Anaconda\Scripts\`：
 
 ```powershell
-conda install -n induvision -c conda-forge cmake ninja
-cmake --version ; ninja --version
+W:\Anaconda\python.exe -m pip install cmake ninja
+cmake --version   # -> cmake version 4.4.4
+ninja --version   # -> 1.13.2.git.kitware.jobserver-pipe-1
 ```
 
-不想动 conda 就走 winget（两个 ID 本机已验证能解析）：`Kitware.CMake` 4.4.4、`Ninja-build.Ninja` 1.13.2。
+版本与 winget 上的 `Kitware.CMake` 4.4.4 / `Ninja-build.Ninja` 1.13.2 一致（两个 ID 本机已验证能解析），
+所以不必再走 winget 装一遍。注意 `W:\Anaconda\Scripts` 得在 PATH 里，或者构建时用全路径。
 
 ### S2 VS 2022 Build Tools + C++ 工作负载（管理员，约 3-7 GB，10-25 min，大头是下载）
 
@@ -77,12 +89,22 @@ TensorRT 10.16 支持 CUDA 13.x，**同大版本内 ABI 稳定**，13.4 的头�
 TensorRT 从 10.x 起在 GitHub 开源，头文件就在仓库里。本机已核实：tag 列表里有 `v10.16`，
 `include/` 下 **14 个文件**（`NvInfer.h` / `NvInferRuntime.h` / `NvInferVersion.h` / `NvInferPlugin.h` 等）。
 
+**这一步也已经做完了**（2026-10-23 06:20 实测，稀疏克隆只取 `include/`，13.5 s）：
+
 ```powershell
-git clone --depth 1 --branch v10.16 https://github.com/NVIDIA/TensorRT $env:TEMP\trt-src
-# 只用 $env:TEMP\trt-src\include，其余（samples / python / transformers）不需要
+git clone --depth 1 --filter=blob:none --sparse --branch v10.16 `
+    https://github.com/NVIDIA/TensorRT "C:\Users\11646\Documents\ChatGPT\简历\_vendor\TensorRT-v10.16"
+cd "C:\Users\11646\Documents\ChatGPT\简历\_vendor\TensorRT-v10.16"; git sparse-checkout set include
 ```
 
-版本必须对齐 pip 装的 `10.16.1.11` —— 头比 DLL 新会在运行期炸，不是编译期。
+拿到 `include\` 下 **14 个头 + `impl\`**（`NvInfer.h` 439 KB、`NvInferRuntime.h` 234 KB）。
+放在仓库**外面**的 `_vendor\`，不入库（本仓库的入库边界由 CI 守着）。
+
+**一个要记下的版本差**：头文件里 `NvInferVersion.h` 写的是 **10.16.0.72（GA）**，
+pip 装的 DLL 是 **10.16.1.11** —— major.minor 一致，patch/build 差一档。
+正常情况下 C++ 侧按 10.16 的 API 编译、运行期加载 10.16.1 的 DLL 没问题；
+真撞上运行期版本断言（TRT 会拿 `getInferLibVersion()` 和头的宏比），
+就去 NVIDIA 归档站下 10.16.1 的 Windows zip（要开发者账号登录，顺带解决 S5 的 `.lib`）。
 
 ### S5 TensorRT import lib（这一步是唯一有不确定性的）
 
@@ -159,10 +181,116 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 
 | 阶段 | 内容 | 估时 |
 | --- | --- | --- |
-| 装机 | S1-S5，含下载与验证 | 1-2 h（下载是大头） |
+| 装机 | S1-S5，含下载与验证（**S1、S4 已完成**；剩 S2 VS Build Tools、S3 CUDA、S5 `.lib`） | 1-2 h（下载是大头） |
 | 打通 | CMake 工程 + engine 反序列化 + 单帧推理，对拍 Python 版 1 张图 | 0.5 天 |
 | 前处理上 GPU | `cudaWarpAffine` letterbox + 与 Python 前处理逐字节比对 | 1 天 |
 | 流水线 | 三线程 + 多流 + pinned 零拷贝 + 500 帧全等校验 | 1 天 |
 | 压测与报告 | 500 帧 P50/P95/P99 + 资源占用 + 与 §6.5 并列的对照表 | 0.5 天 |
 
 合计约 **3 个工作日**。装机那 1-2 h 可以挂着不管，所以真正卡人的是 S5 的 `.lib`。
+
+---
+
+## 7. 接口契约（实测，2026-10-23 06:25）
+
+这一节是把 W3b 建出来的三个 engine 用 Python 侧 TensorRT 打开、逐个 tensor 问出来的，
+**C++ 版照这张表写，不用猜**。
+
+### 7.1 第一个坑：`.engine` 文件不是裸的 TRT 序列化流
+
+直接 `deserializeCudaEngine(整个文件)` 会报：
+
+```
+Serialization assertion header.magicTag == kEXPECTED_MAGIC_TAG failed.
+Trying to load an engine created with incompatible serialization version (844 != 1953657958)
+```
+
+`844` 不是版本号，是**文件头的长度字段**。`tools/build_trt.py` 用 `write_engine_file()`
+按 ultralytics 的约定把 metadata 前置写进了文件（这样 `YOLO("x.engine")` 才认得类别名）：
+
+```
+[4 字节小端长度 = 844] [844 字节 JSON metadata] [裸 TRT engine 流]
+```
+
+三档 engine 的 header 都是 **844 字节**，JSON 里有 15 个键（`names` / `imgsz` / `stride` / `task` /
+`end2end` / `head` / `batch` / `channels` / `version`(8.4.183) / `date` / `description` / `author` /
+`license` / `docs` / `args`）。剥掉头之后三档**全部反序列化成功**。
+
+**Python 侧早就处理了这件事**：`induvision/trt_infer.py` 里有 `encode_header()` / `decode_header()` /
+`read_engine_file()`，`read_engine_file()` 的 docstring 写得很直白 ——「给 `TrtRunner` 用：TRT 只吃纯 engine」。
+W3b/W4① 的所有压测都是走它读的，所以一直没事。
+
+**这次踩坑的是我自己**：查 I/O 契约时图省事直接 `rt.deserialize_cuda_engine(open(p,"rb").read())`，
+没走 helper，于是撞上上面那个报错，第一反应是"engine 和 TRT 版本不兼容"，白绕一圈。
+把报错里的 `844` 当成版本号去查是错的方向 —— **它是文件头的长度字段**，
+`magicTag` 那句只是 TRT 在说"你喂我的前 4 个字节不是我的魔数"。
+
+C++ 侧要把 `decode_header()` 的语义原样复刻（不是简化版）：
+
+1. 前 4 字节按**小端**读成长度 `n`；
+2. `n` 不满足 `0 < n <= 文件长度 - 4` → 认定**没有头**，偏移 0；
+3. `[4, 4+n)` 那段 JSON 解析失败、或解析出来不是 object → 同样认定没有头，偏移 0；
+4. 否则偏移 `4 + n`。
+
+第 2、3 条那个"认不出来就当没有头"的回退必须留着：ultralytics 自己就是这么赌的
+（赌 engine 的原始字节几乎不可能正好构成一段合法 JSON），两边判据不一致就会出现
+"Python 能读、C++ 读不了"或者反过来的情况，那种 bug 最难查。
+另一条路是让 `tools/build_trt.py` 另存一份**不带头的裸流**专供 C++（`encode_header(None)` 返回 `b""`，
+现成的），代价是多一份 12~65 MB 的文件和"两份 engine 是否同一份"的疑问 —— 不推荐，复刻 20 行解析更干净。
+
+### 7.2 三个 tensor，全静态 shape
+
+| # | 名字 | 方向 | shape | dtype | 字节数 |
+| --- | --- | --- | --- | --- | --- |
+| 0 | `images` | INPUT | `(1, 3, 640, 640)` | FLOAT | 4,915,200（4.688 MiB） |
+| 1 | `output0` | OUTPUT | `(1, 51, 8400)` | FLOAT | 1,713,600（1.634 MiB） |
+| 2 | `output1` | OUTPUT | `(1, 32, 160, 160)` | FLOAT | 3,276,800（3.125 MiB） |
+
+三档（fp32 / fp16 / int8）**完全一致** —— 量化只改内部层格式，不改 I/O 契约，
+所以 C++ 版一份代码吃三个 engine，档位只是路径不同。
+
+没有 `-1`，**shape 全静态**，于是不需要 `setInputShape()`，也不需要 profile 查询；
+每帧只要 `setTensorAddress()` 三个地址 + `enqueueV3(stream)`。
+输入 4.688 MiB H2D、输出 4.759 MiB D2H，和 pipeline.md §1 那笔"每帧 4.7 MiB"的账对得上。
+
+### 7.3 激活内存：多流要按 context 数乘
+
+`getDeviceMemorySizeV2()` 实测（Python 侧属性 `device_memory_size`，同一份数据）：
+
+| 档 | engine 文件 | 激活内存（每 context） |
+| --- | --- | --- |
+| fp32 | 65.25 MB | **39.844 MiB** |
+| fp16 | 24.58 MB | **18.286 MiB** |
+| int8 | 12.55 MB | **18.409 MiB** |
+
+**并发执行必须一个 stream 一个 `IExecutionContext`，而每个 context 要一份自己的激活内存**
+（`createExecutionContextWithoutDeviceMemory()` + 手动共享那块内存的做法只在**串行复用**时安全，
+两个 context 同时跑就会互相踩）。所以 §3 第 2 条"多 CUDA stream"的真实代价是
+2 流 fp32 = 79.7 MiB、3 流 = 119.5 MiB 常驻显存。8 GB 的卡上无所谓，但这笔账要写进报告，
+别只报吞吐不报显存 —— 这和 pipeline.md §6.5.3 的 pinned 缓冲 18.893 MiB 是**两笔不同的钱**，
+不要相加也不要混着写。
+
+`device_memory_size` 在 TRT 10.1 起已 deprecated（Python 侧会打 DeprecationWarning），
+C++ 侧直接用 `getDeviceMemorySizeV2()`。
+
+---
+
+## 8. API 核对（实测 grep v10.16 头文件）
+
+计划里要用的符号，逐个在 `_vendor\TensorRT-v10.16\include\` 里搜过，全部存在：
+
+| 符号 | 所在头 | 用途 |
+| --- | --- | --- |
+| `IRuntime::deserializeCudaEngine(void const*, std::size_t)` | `NvInferRuntime.h:1967` | 反序列化（喂剥过头的裸流） |
+| `ICudaEngine::getNbIOTensors()` / `getIOTensorName(int32_t)` | `NvInferRuntime.h:3818 / 3830` | 遍历 I/O，别写死 tensor 名 |
+| `ICudaEngine::getTensorShape / getTensorIOMode / getTensorDataType` | `NvInferImpl.h` | 校验 §7.2 那张表，开机自检 |
+| `ICudaEngine::getDeviceMemorySizeV2()` | `NvInferRuntime.h:3419` | §7.3 的激活内存 |
+| `ICudaEngine::createExecutionContext()` | `NvInfer.h` | 每条流一个 |
+| `IExecutionContext::setTensorAddress(char const*, void*)` | `NvInferImpl.h` | 绑输入/输出设备指针 |
+| `IExecutionContext::enqueueV3(cudaStream_t)` | `NvInfer.h` | TRT 10 的推理入口（V2 那套已废） |
+| `IExecutionContext::setInputShape()` | `NvInfer.h` | **本项目不需要**（shape 全静态） |
+| `IExecutionContext::setAuxStreams()` | `NvInfer.h` | 有多流 DLA/aux 需求才用，当前用不上 |
+
+另外两条实测：`getTensorProfileShape` 在 v10.16 的头里**搜不到**（静态 shape 用不着，
+真需要动态 batch 时再查当时的 API 名）；`cudaStreamCreateWithFlags` 属于 CUDA 运行时，
+不在 TRT 头里，等 S3 装完 CUDA Toolkit 才有。
