@@ -38,8 +38,50 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
+      # 挂了就把 pytest 摘要写成 workflow annotation。原因很实际：actions 的日志下载
+      # 要鉴权（本地没有 token，直接 403），但 annotations 走公开 API 就能读到，
+      # 等于把「哪几条挂了、挂在哪个断言」带回本地，不用去点网页。
       - name: Unit tests
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          log="${RUNNER_TEMP:-/tmp}/pytest.log"
+          python -m pytest -q 2>&1 | tee "$log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+          python - "$log" <<'PY'
+          import pathlib, re, sys
+          raw = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+          lines = raw.splitlines()
+
+          def esc(s, n):
+              s = s.strip().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              return s[:n] or "-"
+
+          def ann(title, msg):
+              print("::error title=" + title + "::" + msg)
+
+          summary = [l for l in lines if re.match(r"^(FAILED|ERROR)\s", l)]
+          ann("pytest-summary", esc(" | ".join(summary[:20]), 900))
+
+          heads = [l.strip("_ ") for l in lines if re.match(r"^_+ .+ _+$", l)]
+          ann("pytest-blocks", esc(" | ".join(heads[:12]), 600))
+
+          elines = []
+          for l in lines:
+              s = l.strip()
+              if s.startswith("E ") and s not in elines:
+                  elines.append(s)
+          for e in elines[:6]:
+              ann("pytest-E", esc(e, 400))
+
+          tail = [l for l in lines if l.strip()][-6:]
+          ann("pytest-tail", esc(" | ".join(tail), 600))
+          print("annotated: %d summary / %d blocks / %d E-lines"
+                % (len(summary), len(heads), len(elines)), file=sys.stderr)
+          PY
+          fi
+          exit "$code"
 
       - name: Guard - core lib must not import torch
         run: |
