@@ -602,12 +602,23 @@ def _stage_report(name: str, durs: Sequence[float], wall: float) -> Dict[str, An
 
 def _report(mode: str, n: int, names: Sequence[str], durs: Sequence[Sequence[float]],
             wall: float, queues: Sequence[RingBuffer], capacity: int,
-            errors: Sequence[Dict[str, Any]], n_out: int) -> Dict[str, Any]:
+            errors: Sequence[Dict[str, Any]], n_out: int,
+            e2e: Optional[Sequence[float]] = None) -> Dict[str, Any]:
+    """汇总一次运行。``e2e`` 是**逐帧端到端延迟**（毫秒），和各阶段耗时是两个口径：
+
+    - 阶段耗时（``stages``）= 这一帧在某一段里被处理了多久，加起来是"干活时间"；
+    - 端到端延迟（``e2e_latency``）= 这一帧从进队到结果出来经过了多久，**含排队等待**。
+
+    所以流水线的 e2e 一定比串行的大（帧在队列里等），而吞吐反而更高 ——
+    这不是矛盾，是"用单帧延迟换吞吐"这笔交易的账面。报数时两个都要给，
+    只报 FPS 会掩盖延迟恶化，只报延迟会让人以为流水线没用。
+    """
     return {
         "mode": mode, "n_items": n, "n_results": n_out, "wall_s": round(wall, 4),
         "throughput_fps": round(n_out / wall, 3) if wall > 0 and n_out else None,
         "capacity": capacity,
         "stages": [_stage_report(nm, d, wall) for nm, d in zip(names, durs)],
+        "e2e_latency": latency_stats(list(e2e or [])),
         "queues": [q.stats() for q in queues],
         "errors": list(errors),
     }
@@ -623,17 +634,20 @@ def run_serial(items: Sequence[Any], stages: Sequence[Any]) -> Tuple[List[Any], 
     items = list(items)
     names = [n for n, _ in st]
     durs: List[List[float]] = [[] for _ in st]
+    e2e: List[float] = []
     out: List[Any] = []
     t0 = time.perf_counter()
     for it in items:
+        s_item = time.perf_counter()
         cur = it
         for k, (_, fn) in enumerate(st):
             s = time.perf_counter()
             cur = fn(cur)
             durs[k].append((time.perf_counter() - s) * 1000.0)
         out.append(cur)
+        e2e.append((time.perf_counter() - s_item) * 1000.0)
     wall = time.perf_counter() - t0
-    return out, _report("serial", len(items), names, durs, wall, [], 0, [], len(out))
+    return out, _report("serial", len(items), names, durs, wall, [], 0, [], len(out), e2e)
 
 
 class Pipeline:
@@ -672,12 +686,20 @@ class Pipeline:
         errors: List[Dict[str, Any]] = []
         stop = threading.Event()
         locks = [threading.Lock() for _ in stages]
+        # 逐帧端到端延迟的两个时间戳。enq_ts 只有 feeder 一条线程写，
+        # 且写的是自己那格（按下标），collector 只在该格已写完之后才会读到它
+        # （结果必然在 put 之后才可能出现在 qout），所以不需要加锁。
+        enq_ts: List[Optional[float]] = [None] * n
+        e2e: List[float] = []
 
         def feeder() -> None:
             try:
                 for i, it in enumerate(items):
                     if stop.is_set():
                         return
+                    # 时间戳打在 put **之前**：队列满时的阻塞等待算这一帧的延迟，
+                    # 打在 put 之后就等于把背压藏起来，P95 会好看但没有意义。
+                    enq_ts[i] = time.perf_counter()
                     qs[0].put((i, it))
             except RuntimeError:
                 pass  # 队列已被关闭（下游出错收尾），feeder 直接退
@@ -724,7 +746,11 @@ class Pipeline:
             item = qout.get()
             if item is None:
                 break
-            got[item[0]] = item[1]
+            t_out = time.perf_counter()
+            idx = item[0]
+            got[idx] = item[1]
+            if enq_ts[idx] is not None:
+                e2e.append((t_out - enq_ts[idx]) * 1000.0)
         wall = time.perf_counter() - t0
         stop.set()
         for q in qs:
@@ -738,7 +764,7 @@ class Pipeline:
             raise PipelineError(e0["stage"], e0["index"],
                                 RuntimeError(e0["error"]))
         return results, _report("pipeline", n, names, durs, wall, qs + [qout],
-                                self.capacity, errors, len(results))
+                                self.capacity, errors, len(results), e2e)
 
 
 def speedup_report(serial_rep: Dict[str, Any], pipe_rep: Dict[str, Any]) -> Dict[str, Any]:

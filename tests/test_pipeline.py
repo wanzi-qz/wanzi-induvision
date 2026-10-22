@@ -23,6 +23,7 @@ from induvision.pipeline import (
     PipelineError,
     RingBuffer,
     _as_predictions,
+    _report,
     batched_nms,
     cxcywh_to_xyxy,
     detections_to_records,
@@ -1252,3 +1253,131 @@ class TestRingBufferWaitCounting:
         rb.put("a")
         th.join(timeout=5)
         assert got == ["a"] and rb.stats()["underflow_waits"] == 1
+
+
+# --------------------------------------------------------------------------
+# 逐帧端到端延迟（W4① 补丁）
+# --------------------------------------------------------------------------
+
+class TestE2ELatency:
+    """``e2e_latency`` 的口径测试。
+
+    和 ``stages`` 里的阶段耗时是两码事：
+
+    - 阶段耗时 = 这一帧在某一段里**被处理**了多久，加起来是"干活时间"；
+    - 端到端延迟 = 这一帧从**进队**到结果出来经过了多久，**含在队列里等的时间**。
+
+    所以流水线的 e2e 必然大于串行，而吞吐同时更高 —— 这不是 bug，是"用单帧延迟
+    换吞吐"这笔交易的账面。下面几条断言把这个口径钉死，尤其是
+    ``test_pipeline_e2e_exceeds_serial_because_of_queueing``：它守的是
+    "时间戳打在 put **之前**"这个决定。哪天有人把它挪到 put 之后，背压等待就被
+    藏起来了，P95 会好看但没有意义，这条测试立刻红。
+    """
+
+    @staticmethod
+    def _slow(ms):
+        def f(x):
+            time.sleep(ms / 1000.0)
+            return x
+        return f
+
+    # -- 串行 --------------------------------------------------------------
+    def test_serial_count_matches_items(self):
+        _, rep = run_serial(list(range(7)), [("a", lambda x: x)])
+        assert rep["e2e_latency"]["count"] == 7
+
+    def test_serial_percentiles_present(self):
+        _, rep = run_serial(list(range(5)), [("a", self._slow(2))])
+        e = rep["e2e_latency"]
+        for k in ("mean_ms", "p50_ms", "p90_ms", "p95_ms", "p99_ms",
+                  "min_ms", "max_ms", "fps"):
+            assert e[k] is not None, k
+
+    def test_serial_e2e_covers_all_stages(self):
+        """串行没有队列，e2e 就该 >= 各阶段耗时之和。"""
+        _, rep = run_serial(list(range(6)), [("a", self._slow(5)), ("b", self._slow(5))])
+        stage_sum = sum(s["mean_ms"] for s in rep["stages"])
+        assert rep["e2e_latency"]["mean_ms"] >= stage_sum * 0.9
+
+    def test_serial_e2e_cross_checks_throughput(self):
+        """串行口径下 1000/e2e 均值 ≈ FPS —— 两套数字互为交叉验证。"""
+        _, rep = run_serial(list(range(20)), [("a", self._slow(5))])
+        e = rep["e2e_latency"]
+        rel = abs(1000.0 / e["mean_ms"] - rep["throughput_fps"]) / rep["throughput_fps"]
+        assert rel < 0.2, f"e2e 均值和吞吐对不上（差 {rel:.1%}），口径被改坏了"
+
+    def test_serial_zero_items(self):
+        _, rep = run_serial([], [("a", lambda x: x)])
+        assert rep["e2e_latency"]["count"] == 0
+        assert rep["e2e_latency"]["p50_ms"] is None
+
+    def test_serial_monotonic_percentiles(self):
+        _, rep = run_serial(list(range(10)), [("a", lambda x: x)])
+        e = rep["e2e_latency"]
+        assert e["min_ms"] >= 0.0
+        assert e["p50_ms"] <= e["p95_ms"] <= e["p99_ms"] <= e["max_ms"]
+
+    # -- _report 本体 ------------------------------------------------------
+    def test_report_without_e2e_gives_empty_stats(self):
+        rep = _report("serial", 0, [], [], 0.0, [], 0, [], 0)
+        assert rep["e2e_latency"]["count"] == 0
+        assert rep["e2e_latency"]["p50_ms"] is None
+
+    def test_report_e2e_none_same_as_missing(self):
+        rep = _report("serial", 0, [], [], 1.0, [], 0, [], 0, e2e=None)
+        assert rep["e2e_latency"]["count"] == 0
+
+    def test_report_passes_e2e_through(self):
+        rep = _report("serial", 3, ["a"], [[1.0, 2.0, 3.0]], 1.0, [], 0, [], 3,
+                      e2e=[10.0, 20.0, 30.0])
+        assert rep["e2e_latency"]["count"] == 3
+        assert rep["e2e_latency"]["mean_ms"] == 20.0
+
+    # -- 流水线 ------------------------------------------------------------
+    def test_pipeline_count_matches_items(self):
+        _, rep = Pipeline([("a", lambda x: x)], capacity=2, join_timeout=5).run(list(range(9)))
+        assert rep["e2e_latency"]["count"] == 9
+
+    def test_pipeline_zero_items(self):
+        _, rep = Pipeline([("a", lambda x: x)], capacity=1, join_timeout=5).run([])
+        assert rep["e2e_latency"]["count"] == 0
+        assert rep["e2e_latency"]["p50_ms"] is None
+
+    def test_pipeline_values_positive_and_finite(self):
+        _, rep = Pipeline([("a", self._slow(1)), ("b", self._slow(1))],
+                          capacity=2, join_timeout=20).run(list(range(8)))
+        e = rep["e2e_latency"]
+        assert e["min_ms"] > 0.0 and e["max_ms"] < 1e6
+        assert e["p50_ms"] <= e["p95_ms"] <= e["p99_ms"]
+
+    def test_pipeline_e2e_exceeds_serial_because_of_queueing(self):
+        """核心断言：三段均衡耗时 + capacity=3，流水线 e2e 必须显著大于串行，
+        同时吞吐更高。这就是"延迟换吞吐"，两个数都得报。"""
+        stages = [("a", self._slow(8)), ("b", self._slow(8)), ("c", self._slow(8))]
+        items = list(range(18))
+        _, s_rep = run_serial(items, stages)
+        _, p_rep = Pipeline(stages, capacity=3, join_timeout=60).run(items)
+        assert p_rep["throughput_fps"] > s_rep["throughput_fps"] * 1.3, \
+            "三段均衡耗时的流水线本该有 ~3x 吞吐"
+        assert p_rep["e2e_latency"]["p50_ms"] > s_rep["e2e_latency"]["p50_ms"] * 1.5, \
+            "排队等待没算进 e2e：时间戳是不是打到 put 后面去了？"
+        assert p_rep["e2e_latency"]["p95_ms"] >= p_rep["e2e_latency"]["p50_ms"]
+
+    def test_pipeline_inflight_bounded_by_capacity(self):
+        """单阶段 capacity=1 时最多 2 帧在飞（队列里 1 帧 + 正在处理 1 帧），
+        所以 e2e 约等于串行的 2 倍而不是 1 倍。"""
+        stages = [("only", self._slow(10))]
+        items = list(range(10))
+        _, s_rep = run_serial(items, stages)
+        _, p_rep = Pipeline(stages, capacity=1, join_timeout=60).run(items)
+        ratio = p_rep["e2e_latency"]["p50_ms"] / s_rep["e2e_latency"]["p50_ms"]
+        assert 1.2 < ratio < 3.5, f"在飞帧数不符合 capacity=1 的预期，实测比值 {ratio:.2f}"
+
+    def test_pipeline_e2e_grows_with_capacity(self):
+        """capacity 就是"延迟换吞吐"的旋钮：队列开越大，缓冲的帧越多，单帧等得越久。"""
+        stages = [("a", self._slow(5)), ("b", self._slow(5)), ("c", self._slow(5))]
+        items = list(range(24))
+        _, small = Pipeline(stages, capacity=1, join_timeout=60).run(items)
+        _, big = Pipeline(stages, capacity=6, join_timeout=60).run(items)
+        assert big["e2e_latency"]["p50_ms"] > small["e2e_latency"]["p50_ms"] * 1.5, \
+            "capacity 变大后 e2e 没有随之变大，说明时间戳没打在 put 之前"
