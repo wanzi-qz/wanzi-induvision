@@ -106,13 +106,27 @@ MVTec AD 是为**无监督异常检测**设计的：官方 `train/` 里只有 `g
 
 细节见 [deploy.md](deploy.md)。
 
-### W3b / W4 待做
+### W3b 三档量化：已完成
 
-TensorRT 还没装（见 [environment.md](environment.md) §6）。装完要做：
+TensorRT 10.16.1.11 装上了（pip wheel，见 [environment.md](environment.md) §6），三档量化实测通关，
+verdict **pass**。原计划用 `trtexec`，但本机根本没有 `trtexec.exe` —— wheel 只带运行期 `.dll`，
+不带头文件、`lib` 和命令行工具，所以构建全部改走 TensorRT Python API（`tools/build_trt.py`）。
+口径、判据与踩坑见 [deploy.md](deploy.md) §8。
 
-- **W3b**：trtexec 三档量化 FP32/FP16/INT8，INT8 用熵校准 + 500 张校准集，记体积 / 掉点 / 延迟 / 显存；
-- **W4**：TensorRT C++ API 推理服务 —— engine 反序列化 → CUDA 流 → 前处理 → 推理 → 后处理（NMS + 掩码解码），
-  pinned memory 零拷贝、解码/推理/后处理三线程流水线 + 环形队列，CMake 组织，最后压测出报告。
+这一轮最值钱的不是数字，是排查：**TensorRT 默认打开 `BuilderFlag.TF32`**，所谓"FP32 档"实际跑的是
+10-bit 尾数的 TF32，逐张量 rel_l2 3.3e-3 卡不过 1e-3 的判据 —— 链路没错，是数值格式的机器精度不够。
+加 `--no-tf32` 另建真 FP32 档，rel_l2 掉到 **2.5e-7**（cosine 1.0），与 W3a 的 ORT 口径一致，
+代价 12% 延迟（9.51 → 10.71 ms）与 21 层额外开销。判据也据此改口径：rel_l2 按数值格式的机器精度定
+（FP32/FP16 收到 1e-2），最终判据是端到端 mAP。
+
+### W4 拆两步
+
+1. **Python 侧先把工程要点做出来并可测**（不依赖 C++ 工具链）：pinned memory 零拷贝 + 异步 H2D/D2H、
+   解码 / 推理 / 后处理三线程流水线 + 环形队列，NMS 与掩码解码落到 numpy/torch，
+   用同一份 30 张清单量吞吐，和 §3.3b 的单帧延迟对照，直接产出"较单线程提升 N×"的数；
+2. **C++ 版**：TensorRT C++ API（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 → 后处理）
+   + CMake 工程 + 500 张端到端 P50/P95 压测。本机实测 `nvcc` / `cmake` / `cl` / `ninja` / `msbuild`
+   全部 not found，也没有 CUDA Toolkit 与 VS 安装目录，得先装 VS Build Tools + CUDA Toolkit（数 GB）。
 
 ---
 
@@ -163,12 +177,30 @@ W2 消融（2 类子集口径，**绝对值不可外引** —— val 仅 29 图 
 providers 里没有 CUDAExecutionProvider。这组数字是留给 W3b 三档量化当同机基线、
 给 W4 的 C++ 服务当「Python 单线程能跑多快」的对照组。
 
+### 3.3b W3b 三档量化（TensorRT 10.16.1.11，同机同轮）
+
+| 档 | engine | 层数 | 激活显存 | mask mAP50-95 | Δ | mean / p95 ms | FPS | 较 `.pt` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP32（TRT 默认含 TF32） | 65.25 MiB | 253 | 39.84 MiB | 0.3707 | -0.0033 vs `.pt` | 9.51 / 11.35 | 105 | 1.46× |
+| FP16 | 24.58 MiB | 190 | 18.29 MiB | 0.3702 | -0.0005 vs FP32 档 | 6.73 / 10.66 | 149 | 2.07× |
+| INT8（minmax + 头配方） | **12.55 MiB** | 168 | 18.41 MiB | 0.3649 | -0.0058 vs FP32 档 | **5.77** / 9.73 | **173** | **2.41×** |
+| 同场对照 PyTorch `.pt`(cuda:0) | — | — | — | 0.3740（基准） | — | 13.90 / 15.89 | 72 | 1.00× |
+
+verdict **pass**；三档构建 456.9 s，压测 78.9 s；校准集 train split 500 / 4490 张
+（`configs/calib_sample.json`，sha256 `20b7ab0c9ce76175`）；进程显存增量 FP32 150 MiB、FP16 / INT8 各 52 MiB。
+体积压缩 FP16 2.7×、INT8 **5.2×**。gate 基准口径：FP32 档对 `.pt`（0.3740），FP16 / INT8 对本轮 FP32 档（0.3707），
+两列 Δ 都给了，别混着减。
+
+读数提醒三条：**延迟只能同一轮内比**（笔记本 GPU 时钟与温度，第一轮 FP16 mean 4.81 ms、第二轮 6.73 ms，+40%，
+同轮内排序两轮一致）；**构建本身不确定**（单跑 INT8 166 层 / 12.53 MiB，三档连跑 168 层 / 12.55 MiB，
+比对看 `engine_sha256`）；**TF32 不是链路错**（`--no-tf32` 对照档 rel_l2 2.5e-7，见 [deploy.md](deploy.md) §8.4）。
+
 ### 3.4 工程
 
 | 项 | 值 |
 | --- | --- |
-| 单测 | **391 条 pytest**，纯 CPU、不联网、不需要真实数据集，base 环境 17.6 s |
-| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 只收 373 条（368 passed / 5 skipped），比本地少 24 条 —— `tests/test_focal.py` 模块级 `importorskip("torch")`，CI 刻意不装 torch，整文件跳过 |
+| 单测 | **563 条 pytest**（W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62），纯 CPU、不联网、不需要真实数据集、也不需要装 tensorrt（`import tensorrt` 全延迟到函数内），base 环境 19.7 s |
+| CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件在 CI 里全量跑 |
 | 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 | 入库边界 | CI 断言守着：`git ls-files` 出现 `data/`、`weights/`、`out/`、`runs/` 或任何 `.pt/.onnx/.engine/.trt` 就失败 |
 

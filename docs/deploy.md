@@ -292,33 +292,216 @@ sha256 `eccfd964426a2637` 这一份清单（`--align-n 16 --bench-n 30 --val --v
 | `tests/test_deploy.py` | 51 | letterbox 逐条对齐 ultralytics（含奇数余量时上下差 1 px、pad 颜色、`scaleup` 两种口径、还原坐标用的元信息）、preprocess 的形状/dtype/值域/通道序/无 batch 维、compare_tensors 的形状前置与退化输入（全零、正交、等比缩放）、latency_stats 的分位与空输入、sample_paths 的等间距与确定性、read_split_images 的六种 data.yaml 写法、read_image_bgr 的两条兜底路径；**新增 16 条**盖清单读写：relative_to_root 的相对/绝对两条分支、sample_fingerprint 的顺序敏感与机器无关、write/load_sample_list 的往返一致、version 不符抛 ValueError、JSON 损坏抛 ValueError、strict 缺图抛 FileNotFoundError、非 strict 把缺图列进 `meta["missing"]`、root 的三级优先级 |
 | `tests/test_export_onnx.py` | 11 + 4 skip | 路径与命名推导、CLI 口径是否正确落到配置、ONNX 图的静态体检解析（动态/静态 batch 两种）、checker 失败时的收口；skip 的 4 条要 `onnx`（CI 不装，`importorskip`） |
 | `tests/test_verify_onnx.py` | 59 | `_torch_device`、`_delta`、`load_reference`（缺文件 / JSON 损坏）、`check_align` 与 `check_val` 的每条判据、`_md` 三层渲染（含无参照时的 `—`、只有一个后端时跳过另一行）、CLI 的路径推导与四种错误收口、`_load_inputs` 的前处理与坏图跳过；**新增 22 条**盖固定口径：`_load_inputs_indexed` 的下标与坏图跳过、`_take_upto` 按清单下标切（坏图不平移口径）、`resolve_sample` 的全部分支（清单命中 / `--no-sample-list` / 清单缺失 / version 不符 / split 不符 / 图不在本次 split / `strict=True` 抛）、CLI 的五个清单参数与相对路径按 `REPO_ROOT` 还原、`--dry-run --sample-list-out` 真的落清单、`--strict-sample` 返回 2、清单张数不够返回 2、`_md` 的抽样口径行与降级 `> 注意：` 引文 |
+| `tests/test_trt_infer.py` | 36 | engine 文件的 ultralytics 风格 metadata header：`encode_header`/`decode_header` 往返、`_coerce` 把 `names`/`stride`/`imgsz` 还原成 dict/int、无 metadata 时退化成纯 blob、`write_engine_file`/`read_engine_file` 往返一致、`onnx_metadata` 缺 props 返回空、`device_memory_bytes`、`TrtRunner` 在没装 tensorrt 时的报错口径 |
+| `tests/test_make_calib_list.py` | 24 | 校准清单：`class_of` 从路径反推类别、`dataset_root` 的三级回退、`build_list` 的等间距抽样与覆盖统计、拒绝 val/test split（校准集只能用 train，防止拿评测集校准）、拒绝 n<=0 与母体不足、幂等（同参数重跑同指纹）、指纹不同拒绝覆盖、瘦类别覆盖告警、dry-run 不落盘、写出的清单能被 strict 模式读回 |
+| `tests/test_build_trt.py` | 50 | `pin_layers_fp16`（失败对照）与 `constrain_head_precisions`（能过的配方）：头是最大 model 索引、sigmoid→FP32、`.2/Conv` 与 `/dfl/`→FP16、非头层不动、无名层不崩、逐输出都 set；`make_calibrator` 的批生命周期（`get_batch` 返回裸 `data_ptr()`，张量必须挂在 `self._cur`）、`get_algorithm` 已重写、`CALIB_ALGOS` 映射、缓存命中/未命中/写缓存建父目录、缺基类与缺枚举时报错指向下一步；`load_calib_inputs` 的分批与跳过留痕；`--int8-pin` 与 `--int8-head` 互斥；`main` 的返回码（2 用法/输入、3 缺 tensorrt）与 dry-run 命名推导；**新增 4 条**盖 TF32：fake builder 全链路 harness（`FakeConfig` 记 `set_flag`/`clear_flag`，`FakeLogger` 必须是真类 —— `SimpleNamespace` 塞 `__call__` 不生效）、默认开 TF32、`--no-tf32` 真的 `clear_flag`、与 FP16 flag 共存（断言用 `set()`，顺序不重要）、dry-run 报 `tf32=` 状态 |
+| `tests/test_bench_trt.py` | 62 | 三层判据逐条：`align_engine` 的形状前置与逐输出指标、`check_align` 的 cosine/rel_l2 卡线、`gate_tier` 三档各自的判据（含 INT8 只看 mAP）、`low_prec_share` 的层格式占比、`build_report_tiers` 读构建报告（键是 `engines` 不是 `builds`）、`build_table` 引报告里的体积/层数、`latency_stats` 分位、`val_engine` 的 mAP 抽取、`_md` 渲染（无参照时的 `—`）、`main` 的缺 engine/缺 data.yaml 返回 2、run 名从权重路径反推、阈值覆盖只作用在 fp32/fp16；**阈值那条改写成** `test_thresholds_fp32_fp16_match_their_numeric_format`（卡 1e-2，理由写在注释里：按数值格式的机器精度定判据，最终判据是端到端 mAP），另加 `test_rel_l2_threshold_still_admits_tightening_via_cli`（`--max-rel-l2 1e-5 --dry-run` 仍可收紧，判据不是写死的） |
 
-全量 **391 passed / 6 skipped**（base 环境，纯 CPU、不联网、不需要真实数据集，17.6 s）。
+全量 **563 passed / 6 skipped**（base 环境 `W:\Anaconda\python.exe`，纯 CPU、不联网、
+不需要真实数据集，19.7 s）。W3b 新增 172 条：trt_infer 36 / make_calib_list 24 /
+build_trt 50 / bench_trt 62。**这些测试都不需要装 tensorrt** —— `build_trt` / `bench_trt`
+里的 `import tensorrt` 全部延迟到函数内，CI 只跑逻辑不跑 GPU。
 CI 里那 6 条 skip = 4 条要 onnx + 原有 2 条。
 
-## 8. 下一步（W3 后半段，待测）
+## 8. W3b 三档量化实测（TensorRT 10.16.1.11）
 
-TensorRT 还没装（见 [environment.md](environment.md) §6）。装完先跑
-`tools/env_check.py --export` 自检，再动量化。要记的数：
+实测时间 2026-10-23，git `17ded7d` + 本轮工具改动。
 
-| 档 | 要点 | 要记的数 |
+### 8.0 这轮的口径先说清楚
+
+`pip install tensorrt-cu13` 装的是 wheel，**机器上没有 trtexec.exe**（只有 Python 模块）。
+所以本节所有 engine 都是 `tools/build_trt.py` 用 Python API（`trt.Builder` +
+`build_serialized_network`）建的，压测走 `tools/bench_trt.py`，engine 的反序列化 / metadata
+header / 前处理上显存封在 `induvision/trt_infer.py::TrtRunner`。前面 §8 老版本里写的
+「trtexec 直接建 engine」那条计划作废，命令见 §8.9。
+
+三档共用同一份 ONNX（W3a 导出的 `weights/baseline15_fp32.onnx`，sha256 `261623c3913a0340`）。
+抽样口径是入库清单 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`，前 16 张做逐张量对齐、
+前 30 张做延迟）；校准集另有一份 500 张的 `configs/calib_sample.json`（sha256 `20b7ab0c9ce76175`，从 train split 4490 张等间距抽，
+由 `tools/make_calib_list.py` 生成并入库）。
+环境：NVIDIA GeForce RTX 4060 Laptop GPU / TRT 10.16.1.11 / CUDA 13.0 / Python 3.12.5 / torch 2.13.0+cu130 / ultralytics 8.4.183。
+
+### 8.1 构建结果
+
+| 档 | engine | 落盘（含 header） | 构建 | 层数 | 激活显存 | builder flags | 层输出格式 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FP32 | 65.25 MiB | 65.25 MiB (header 848 B) | 94.0 s | 253 | 39.84 MiB | `无` | Float 253 (100.0%) |
+| FP16 | 24.58 MiB | 24.58 MiB (header 848 B) | 210.9 s | 190 | 18.29 MiB | `FP16` | Half 163 (85.8%) / Float 27 (14.2%) |
+| INT8 | 12.55 MiB | 12.55 MiB (header 848 B) | 152.0 s | 168 | 18.41 MiB | `INT8, FP16(fallback), OBEY_PRECISION_CONSTRAINTS, calib=minmax` | Int8 107 (63.7%) / Half 44 (26.2%) / Float 17 (10.1%) |
+
+三点值得说：
+
+- **INT8 档不是纯 INT8**：168 层里只有 107 层（63.7%）真落在 Int8，44 层 Half、17 层 Float。这是 §8.3 那个构建失败的直接代价——
+  不给它 FP16 退路，SM89 上连一条可用实现都选不出来。报压缩比的时候必须连着这个直方图一起报，
+  否则会高估量化程度。
+- **压缩比**：FP32 65.25 → FP16 24.58（2.65×）→ INT8 12.55 MiB（5.2×）。
+- **激活显存**（`engine.device_memory_size`，不含权重）：39.84 → 18.29 → 18.41 MiB。
+  INT8 比 FP16 略高，混合精度要在两种格式之间留 reformat 缓冲。
+
+### 8.2 压测三层结果
+
+| 档 | mask mAP50-95 | Δ vs 判据基准 | Δ vs `.pt` | mask mAP50 | box mAP50-95 | worst cosine | out0 / out1 rel_l2 | mean / p50 / p95 ms | FPS | 进程显存增量 | gate |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP32 | 0.3707 | -0.0033 | -0.0033 | 0.6694 | 0.4152 | 0.99999465 | 8.342e-04 / 3.275e-03 | 9.51 / 9.39 / 11.35 | 105.2 | 150.0 MiB | pass |
+| FP16 | 0.3702 | -0.0005 | -0.0038 | 0.6690 | 0.4146 | 0.99997915 | 1.110e-03 / 6.515e-03 | 6.73 / 6.69 / 10.66 | 148.6 | 52.0 MiB | pass |
+| INT8 | 0.3649 | -0.0058 | -0.0091 | 0.6676 | 0.4002 | 0.93541（不卡） | 6.261e-02 / 4.541e-01 | 5.76 / 5.47 / 9.73 | 173.5 | 52.0 MiB | pass |
+
+参照：`.pt` 在 test split（435 张）上 mask mAP50-95 = **0.3740**（`runs/segment/baseline15/eval_test.json`）。同场量的 PyTorch GPU 单线程基线 mean 13.90 ms / p95 15.89 / 72.0 FPS。
+
+**两列 Δ 的基准不一样，别混着看**：FP32 档的判据基准是 `.pt`（0.3740），FP16 / INT8 的判据基准是本轮 FP32 档（0.3707）——端侧真正在乎的是「相对已经上了车的部署基线掉了多少」，而 FP32 engine 就是 TRT 侧的基线；
+`.pt` 那一列是给你看整条链路（导出 + 量化）加起来一共掉了多少。
+
+**verdict = pass**，三档 gate 全过。按判据基准算的掉点：FP32 -0.0033（对 `.pt`）、FP16 -0.0005、INT8 -0.0058（都对 FP32 档）；对 `.pt` 算则分别是 -0.0033 / -0.0038 / -0.0091。INT8 的判据是 ≤0.03，实测只用掉约 19%。
+
+- **INT8 用 12.55 MiB（5.2× 压缩）换 0.0058 mAP（对 FP32 档；对 `.pt` 是 0.0091）**，端侧这一档划算。
+- FP16 几乎不掉点（-0.0005，和 FP32 的 -0.0033 在同一噪声量级），显存够又要稳就选 FP16。
+- 相对 PyTorch GPU 单线程：FP16 2.07×、INT8 2.41×（同轮内比较，见 §8.5）。
+
+### 8.3 INT8 构建挂了四次，根因是两层
+
+报错信息是误导性的，所以写详细一点。
+
+**第一层：`IInt8Calibrator.get_algorithm()` 是纯虚函数，Python 绑定不给默认实现。**
+不重写它，TRT 每取一次校准算法就抛
+
+```
+[ERROR] Exception caught in get_algorithm(): Tried to call pure virtual function "IInt8Calibrator::get_algorithm"
+```
+
+builder 拿不到算法，最后报出来的却是另一句：
+
+```
+[TRT] [E] IBuilder::buildSerializedNetwork: Error Code 10: Internal Error
+          (Could not find any implementation for node /model.22/proto/cv3/Conv + PWN(Sigmoid, Mul))
+```
+
+**这行指向 mask proto 分支，跟校准器一点关系都没有。** 照着它调了三轮精度都是白费。
+修法：`_Calib.get_algorithm()` 返回 `trt.CalibrationAlgoType.<枚举>`，枚举名走
+`CALIB_ALGOS = {'minmax': 'MINMAX_CALIBRATION', 'entropy': 'ENTROPY_CALIBRATION_2'}`，
+基类 `IInt8Calibrator`。本机 `entropy` 仍然建不出来（同一条 Error Code 10），
+`minmax` 能过，所以默认 minmax（本轮 INT8 用的就是它，校准 0 批 × 8 张，
+缓存命中 True）。
+
+**第二层：光有校准器不够，检测头必须显式留精度例外。** 照抄 ultralytics 8.4.183
+`utils/export/engine.py:433-465` 的配方，实现为 `constrain_head_precisions()`：
+
+- 头 = 层名以 `/model.{最大索引}/` 开头的那些（本模型是 `/model.22/`，命中 **32 层**）；
+- 头里名字含 `sigmoid` 的 ACTIVATION → 钉 **FP32**（sigmoid 在 INT8 下动态范围被压平，置信度整体偏）；
+- 头里以 `.2/Conv` 结尾、或名字含 `/dfl/` 的 CONVOLUTION → 钉 **FP16**（DFL 的 softmax 回归和
+  输出卷积对量化最敏感）；
+- 逐输出 `set_output_type()` + 打开 **`OBEY_PRECISION_CONSTRAINTS`**。
+
+失败路线留档（都真跑过）：
+
+| 尝试 | 结果 | 结论 |
 | --- | --- | --- |
-| FP32 | trtexec 直接建 engine | 体积、mAP、mean/p95 延迟、显存 |
-| FP16 | 加 `--fp16` | 同上 + 相对 FP32 的掉点 |
-| INT8 | 熵校准，500 张校准图 | 同上 + 校准集口径 + 判据放宽到多少 |
+| workspace 提到 6 GB | 同一条 Error Code 10 | 不是 workspace 不够，别往这个方向调 |
+| 只开 `INT8 + FP16(fallback)`、不钉头 | 同上失败 | fallback 的意思是「没有 INT8 tactic 时可以退」，但那个融合节点连退路都选不出来，必须显式指定精度 |
+| `PREFER_PRECISION_CONSTRAINTS` + 钉 `proto/cv3` 三层 FP16 | 命中 3 层，仍失败 | PREFER 是「尽量」，TRT 可以不采纳；要 OBEY。而且只钉 3 层不够，得整个头 |
+| `--int8-calib entropy` | 构建失败 | 本机 SM89 + TRT 10.16 上熵校准建不出 engine，minmax 可以 |
 
-两点先说清楚，免得后面走弯路：
+`--int8-pin`（PREFER 那条）留在代码里当失败对照，与 `--int8-head` 互斥：同时开 TRT 行为未定义，
+而且两者是同一个问题的两种解法，混用了掉点数没法归因。
 
-- **校准集从固定清单出，不要现场抽**：先
-  `--sample-n 500 --sample-list-out configs/calib_sample.json --dry-run` 生成一份入库清单
-  （口径与 §4.0 完全一致：等间距、只取决于排序后的列表、sha256 落进报告），校准与复现都读它。
-  两个理由：随机抽 500 张有可能全落在少数几类上，校准出来的动态范围会偏；现场抽则每轮都不一样，
-  INT8 的掉点没法归因。当前基准清单只有 64 张（母体 435），做 INT8 要另生成 500 张的那份，
-  两份清单各自记 sha256，别混用。
-- **trtexec 的 `--calib` 是校准缓存文件，不是图片目录。** 要用真实图做 INT8 校准，
-  得自己实现 `IInt8EntropyCalibrator2`（C++ 或 Python）先把缓存生成出来。这一步的口径
-  等 TensorRT 装完实测确认，不在这里预写命令。
+### 8.4 FP32 档 rel_l2 3.3e-3 不是链路错，是 TF32
 
-每档跑完都要重走一遍第 1、2 层校验。FP16 沿用 cosine ≥ 0.9999 / rel_l2 ≤ 1e-3；
-INT8 的 rel_l2 判据必然要放宽，放宽到多少、为什么放宽，实测出来再写进这一节。
-（三档的精度-速度-显存对照表等实测出来再填，这里不预填数字。）
+第一轮压测 verdict=fail，挂在 FP32 档 out1 rel_l2 3.275e-03 > 1e-3。
+W3a 里 ONNX Runtime 对 PyTorch 是 2.4e-7，差四个数量级，看着像前处理或输出解码写歪了。
+实际原因：**TensorRT 默认打开 `BuilderFlag.TF32`**，所谓 FP32 档跑的是 TF32（10-bit 尾数），
+rel_l2 停在 1e-3 量级就是这个格式的机器精度，跟链路无关。
+
+加了 `build_trt.py --no-tf32`（`config.clear_flag(trt.BuilderFlag.TF32)`）另建一档真 FP32 验证：
+
+| | TF32 开（默认） | TF32 关（`--no-tf32`） |
+| --- | --- | --- |
+| 层数 | 253 | 274 |
+| engine | 65.25 MiB | 65.33 MiB |
+| 激活显存 | 39.84 MiB | 41.73 MiB |
+| 构建 | 94.0 s | 96.7 s |
+| out0 rel_l2 | 8.342e-04 | 2.500e-07 |
+| out1 rel_l2 | 3.275e-03 | 1.290e-06 |
+| worst cosine | 0.99999465 | 1.00000000 |
+| mean 延迟 | 9.51 ms | 10.71 ms |
+| mask mAP50-95 | 0.3707 | 0.3700 |
+
+关掉 TF32 后 rel_l2 回到 2.5e-07 / 1.3e-06，和 W3a 的 ORT 口径对齐，**证明前处理与输出解码没问题**；代价是 13% 延迟和多 21 层（少了 TF32 可用的 tactic，融合方式变了）。端到端 mAP 两边差 0.0006，在噪声里。这一档 verdict 也是 pass（判据 rel_l2 ≤ 1e-5）。
+
+所以逐张量判据按数值格式重定了（`DEFAULT_THRESHOLDS`）：FP32/FP16 的 `max_rel_l2` 从 1e-3 放宽到
+**1e-2**，cosine 仍卡 0.9999；INT8 不做逐张量卡线（动态范围量化后逐元素差没有物理意义，
+本轮 out1 rel_l2 就到 4.54e-01、cosine 0.935），只看端到端 mAP ≤ 0.03。
+**最终判据始终是端到端 mAP**；逐张量那层是用来定位「错在链路哪一段」的，不是用来卡发布的。
+要卡 1e-5，就用 `--no-tf32` 那一档。
+
+### 8.5 延迟只能同一轮内比
+
+同一批 engine 连跑两轮，数字差得不小：
+
+| 档 | 第一轮 mean / p95 / FPS | 第二轮 mean / p95 / FPS | 差 |
+| --- | --- | --- | --- |
+| FP32 | 9.00 / 11.40 / 111.1 | 9.51 / 11.35 / 105.2 | mean +6% |
+| FP16 | 4.81 / 7.59 / 207.7 | 6.73 / 10.66 / 148.6 | mean +40% |
+| INT8 | 4.74 / 8.02 / 211.1 | 5.76 / 9.73 / 173.5 | mean +22% |
+
+FP16 两轮差 40%。笔记本 GPU（RTX 4060 Laptop 8 GB）的时钟与温度状态主导了这个差异，
+30 张图 + 3 轮 warmup 的样本量压不住它。
+
+能用的结论只有**同轮内的相对关系**，两轮一致：延迟 FP32 > FP16 ≳ INT8。
+INT8 与 FP16 的延迟差在本机基本被前/后处理吃掉了（mean 5.76 vs 6.73 ms），
+**INT8 在本机的收益是体积和显存，不是速度**。跨轮引用延迟数字等于编数：报告里落的是第二轮
+（`runs/logs/trt_bench_baseline15.json`），第一轮日志留档在 `runs/logs/_bench15.log`。
+
+### 8.6 构建本身不确定
+
+同一个 ONNX、同一份校准缓存、同一条命令，INT8 档两次构建结果不同：单档跑 166 层 / 12.53 MiB / 159.3 s，三档连着跑 168 层 / 12.55 MiB / 152.0 s。
+TRT 选 tactic 靠现场计时，受当时 GPU 状态影响，层融合结果跟着变。
+**所以层数和体积只能当区间看，要比对就比 `engine_sha256`**（本轮三档的 sha 都落在构建报告里）。
+
+### 8.7 三类告警是良性的
+
+- `buildCaskGraphShaderImpl: CASK failed to generate a shader. This may be a bug.` —— 几十条，
+  构建照样成功。CASK 是 TRT 的 kernel 生成后端之一，某个 tactic 生成失败就换一个。
+- `Missing scale and zero-point for tensor /model.22/Range_*_output_0, expect fall back to non-int8` ——
+  这些是检测头里 `Range` / `ShapeShuffle` 产生的索引张量（整数坐标，本来就不该量化），
+  TRT 自己说明会回退到非 INT8 实现，正是想要的行为。
+- `DeprecationWarning: ... Superseded by explicit quantization.` —— 隐式量化（calibrator）在 TRT 10
+  已标记废弃，TRT 11 会移除 `IInt8Calibrator`；`make_calibrator` 已经为这种情况准备了直指
+  QDQ / FP16 的报错，不至于到那时只拿到一句 AttributeError。
+
+### 8.8 与 ultralytics 原生导出交叉对照
+
+`yolo export format=engine int8=True` 自己导出的 `runs/segment/baseline15/weights/best.engine` 是
+13,331,868 B（12.71 MiB）。本轮自建的 INT8 是 12.55 MiB（13156580 B 落盘），同一量级、略小
+（头部例外的钉法与它不完全一样）。这个对照的意义是**证明自建链路没跑偏**：差出一个数量级
+就说明头配方或校准集口径有问题。
+
+### 8.9 复现命令
+
+```powershell
+conda activate induvision
+# 1) 校准清单：500 张，从 train split 等间距抽，入库（configs/calib_sample.json）
+python tools/make_calib_list.py --data out/yolo_mvtec15/data.yaml --split train --n 500
+# 2) 三档 engine：INT8 = minmax 校准 + ultralytics 头配方 + OBEY_PRECISION_CONSTRAINTS
+python tools/build_trt.py --prec fp32 fp16 int8
+# 3) 三层压测：逐张量对齐 16 张 / 端到端 mAP 全 test 435 张 / 延迟 30 张 + PyTorch 同场对照
+python tools/bench_trt.py --val --markdown
+# 4) 真 FP32 对照档（验 §8.4 的 TF32 结论）
+python tools/build_trt.py --name baseline15_notf32 --prec fp32 --no-tf32
+python tools/bench_trt.py --name baseline15_notf32 --precs fp32 --val --max-rel-l2 1e-5
+```
+
+落档：`runs/logs/trt_build_baseline15.json`（三档构建）、`trt_bench_baseline15.json`（三层压测）、
+`trt_build_baseline15_notf32.json` / `trt_bench_baseline15_notf32.json`（TF32 对照）。都不入库。
+
+### 8.10 W4 还剩什么，以及本机缺什么
+
+W4 的目标是 C++ 推理服务。本机工具链实测缺失：`nvcc` / `cmake` / `cl`(MSVC) / `ninja` / `msbuild`
+全部 not found，也没有 CUDA Toolkit 与 Visual Studio 安装目录（TRT 是 pip wheel 装的，
+只带运行期 `.dll`，不带头文件与 `lib`）。要做 C++ 版得先装 VS Build Tools + CUDA Toolkit（数 GB）。
+
+因此 W4 拆成两步，第一步不依赖 C++ 工具链：
+
+1. **Python 侧把工程要点先做出来并可测**：pinned memory 零拷贝 + 异步 H2D/D2H、
+   解码 / 推理 / 后处理三线程流水线 + 环形队列、NMS 与掩码解码落到 numpy/torch，
+   用同一份 30 张清单量吞吐，和 §8.2 的单帧延迟对照（这一步能直接产出「较单线程提升 N×」的数）。
+2. **C++ 版**：`TensorRT C++ API`（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 →
+   后处理）+ CMake 工程 + 500 张端到端 P50/P95 压测。等工具链装好再做，不预写命令。

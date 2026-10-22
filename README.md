@@ -22,8 +22,8 @@
 | W1b | 15 类全量数据 + 基线训练（mAP50-95、单类 AP、混淆矩阵） | 完成 → [docs/baseline.md](docs/baseline.md) §2：15 类 / 5354 图（sha256 全过，转换 27.7 s），baseline15 在 test split 上 mask mAP50-95 **0.3740** / mAP50 0.6730，box 0.4229 / 0.6652，best @ ep75、ep95 早停 |
 | W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 完成（5 组全出数）→ [docs/baseline.md](docs/baseline.md) §3：Copy-Paste 把 mask mAP50-95 从 0.2453 抬到 **0.4071**（+66%），整张复制的过采样 **0.4003** 与它基本打平（差 0.0068），focal 在这个规模上是**负收益**（C1 0.1953，B2 0.0039 直接学崩）。绝对值不可外引（val 仅 29 图 / 16 实例） |
 | W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟）+ 固定抽样清单 | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass**。口径基准 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`），见 §4.0 |
-| W3b | trtexec FP32/FP16/INT8（熵校准，500 张校准集） | 未开始（TensorRT 待装，见 [docs/environment.md](docs/environment.md) §6） |
-| W4 | TensorRT C++ 推理服务：零拷贝 + 三线程流水线 + CMake + 压测报告 | 未开始（工具链待装） |
+| W3b | TensorRT 三档量化 FP32/FP16/INT8（minmax 校准，500 张校准集）+ 三层压测 | 完成 → [docs/deploy.md](docs/deploy.md) §8：INT8 **12.55 MiB**（较 FP32 档 5.2× 压缩）/ 5.77 ms / **173 FPS**（较同场 PyTorch `.pt` **2.41×**），mask mAP50-95 0.3707 → 0.3649（-0.0058，判据 ≤0.03 只用掉 19%），三档 verdict **pass**。踩坑：TensorRT 默认开 TF32，"FP32 档"逐张量 rel_l2 3.3e-3 卡不过判据，`--no-tf32` 才降到 2.5e-7（§8.4） |
+| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | 拆两步（[docs/deploy.md](docs/deploy.md) §8.10）：① Python 侧流水线原型待做，不依赖 C++ 工具链；② C++ 版 + CMake 等 VS Build Tools / CUDA Toolkit —— 本机实测 `nvcc`、`cmake`、`cl`、`ninja`、`msbuild` 全缺 |
 
 ## 仓库结构
 
@@ -36,6 +36,7 @@ induvision/          核心库（只依赖 numpy / opencv / pyyaml，CI 能全�
   balance.py             类别不均衡诊断 + 合成配额规划
   focal.py               Focal Loss：给 ultralytics 分类分支换损失，可装可卸（LIFO）
   deploy.py              部署链路的纯 CPU 基础设施：复刻 ultralytics 前处理口径、张量比差、延迟分位、抽样清单读写与指纹
+  trt_infer.py           TensorRT 运行期：engine 读写（带 ultralytics 风格 metadata header）、device_memory、TrtRunner
 tools/
   env_check.py           环境与推理链路自检（可选 --export 验 ONNX 导出）
   download_mvtec.py      取数据：官方 zip 手动模式 / HF 镜像自动模式，逐文件 sha256
@@ -45,14 +46,18 @@ tools/
   eval_seg.py            在 test split 上重算成绩 + 逐类 AP 表（best.pt 是 val 选的，不能拿 val 报数）
   export_onnx.py         .pt -> .onnx，导完立刻静态体检（opset / 动态轴 / checker / 算子清单）
   verify_onnx.py         .pt 与 .onnx 是否等价：固定抽样清单 -> 逐张量对齐 -> 端到端 mAP -> 单帧延迟，各层带判据
+  make_calib_list.py     INT8 校准清单：只从 train split 等间距抽，带 sha256 指纹与逐类覆盖统计（拒绝 val/test）
+  build_trt.py           .onnx -> TensorRT engine：三档精度、minmax 校准器、头精度配方、--no-tf32 对照档
+  bench_trt.py           三档压测：逐张量对齐 / 端到端 mAP / 单帧延迟 + PyTorch 同场对照，各层带判据与 verdict
   summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，校验「单变量协议」与数据集转换环境指纹
   run_ablation_queue.ps1 消融队列（幂等 + 崩溃自动重试）：跑完的组自动跳过，中断的组搬残档后原地重跑
   run_train_guarded.ps1  单组训练守护：等显存 -> 跑 -> 崩了搬残档重试，最多 -MaxAttempts 次
   run_overnight.ps1      串联：补跑消融 -> baseline15 -> test 评测 -> 汇总表，一次挂上不用守
   run_download_mvtec.ps1 后台拉全量数据（脱离宿主 shell，日志落 runs/logs/）
   make_fake_mvtec.py     生成合成 MVTec 目录树，供 CI 端到端冒烟
-configs/             入库的配置：bench_sample.json 固定抽样清单（部署校验的口径基准，带 sha256 指纹）
-tests/               391 条 pytest，纯 CPU、不联网、不需要真实数据集
+configs/             入库的配置：bench_sample.json 固定抽样清单（部署校验的口径基准）、
+                     calib_sample.json INT8 校准清单（train split 500 张），都带 sha256 指纹
+tests/               563 条 pytest，纯 CPU、不联网、不需要真实数据集
 docs/                overview.md 项目说明（背景 / 方法 / 结果，先看这个）
                      environment.md 环境 / dataset.md 数据与协议
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
@@ -111,7 +116,15 @@ python tools/verify_onnx.py --weights runs/segment/baseline15/weights/best.pt `
 # 清单在就用清单，对不上就降级并在 stdout / JSON / Markdown 三处留痕；不接受降级加 --strict-sample
 # 前处理复刻口径、三条判据、固定抽样清单与踩坑记录见 docs/deploy.md
 
-# 8) 单测（391 条，约 18 秒；base 环境没装 torch/onnx 会自动跳 6 条）
+# 7b) TensorRT 三档量化与压测（要 GPU + tensorrt，本机在 conda env: induvision 里）
+python tools/make_calib_list.py --data out/yolo_mvtec15/data.yaml --split train --n 500
+python tools/build_trt.py --prec fp32 fp16 int8      # 三档连建 456.9 s
+python tools/bench_trt.py --val --markdown           # 三层压测 78.9 s，出 verdict
+# 本机没有 trtexec.exe（pip wheel 只带运行期 .dll），三档全走 TensorRT Python API
+# 想看关掉 TF32 的真 FP32 对照档：build_trt.py --name x --prec fp32 --no-tf32
+# 三档实测数字、TF32 排查、INT8 连挂四次的根因见 docs/deploy.md §8
+
+# 8) 单测（563 条，约 20 秒；base 环境没装 torch/onnx 会自动跳 6 条）
 python -m pytest -q
 ```
 
@@ -215,6 +228,30 @@ CUDAExecutionProvider（只有 `AzureExecutionProvider, CPUExecutionProvider`）
 表里是**固定清单口径**这一轮。生成清单之前那轮（第 3 层 ORT mean 98.14 ms / PyTorch 16.08 ms）
 用的不是同一批图，两轮数字不可直接相减 —— 为什么要固定、固定成什么样，见
 [docs/deploy.md](docs/deploy.md) §4.0；完整口径、读数提醒与踩坑记录同见该文。
+
+W3b TensorRT 三档量化实测（2026-10-23，同一台机器同一轮压测；校准集 `configs/calib_sample.json`，
+train split 500 / 4490 张，sha256 `20b7ab0c9ce76175`）：
+
+| 档 | engine | 层数 | 构建 | mask mAP50-95 | Δ | mean / p95 ms | FPS | 较 `.pt` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FP32（TRT 默认含 TF32） | 65.25 MiB | 253 | 94.0 s | 0.3707 | -0.0033 vs `.pt` | 9.51 / 11.35 | 105 | 1.46× |
+| FP16 | 24.58 MiB | 190 | 210.9 s | 0.3702 | -0.0005 vs FP32 档 | 6.73 / 10.66 | 149 | 2.07× |
+| INT8（minmax + 头配方） | **12.55 MiB** | 168 | 152.0 s | 0.3649 | -0.0058 vs FP32 档 | **5.77** / 9.73 | **173** | **2.41×** |
+| 同场对照 PyTorch `.pt`(cuda:0) | — | — | — | 0.3740（基准） | — | 13.90 / 15.89 | 72 | 1.00× |
+
+verdict **pass**，三层判据全过；INT8 的掉点判据是 ≤0.03，实测 -0.0058 只用掉 19%。
+体积压缩 FP16 2.7×、INT8 **5.2×**；进程显存增量 FP32 150 MiB、FP16 / INT8 各 52 MiB。
+
+三条读数提醒（都在 [docs/deploy.md](docs/deploy.md) §8 里写透了）：
+
+- **TF32**：TensorRT 默认打开 `BuilderFlag.TF32`，"FP32 档"跑的是 10-bit 尾数，逐张量 rel_l2 3.3e-3
+  过不了 1e-3；`--no-tf32` 另建真 FP32 档后掉到 **2.5e-7**（cosine 1.0），代价 12% 延迟（9.51 → 10.71 ms）。
+- **延迟只能同一轮内比**：笔记本 GPU 的时钟与温度，第一轮 FP16 mean 4.81 ms、第二轮 6.73 ms（+40%），
+  同轮内三档排序两轮一致。
+- **构建本身不确定**：单跑 INT8 得 166 层 / 12.53 MiB，三档连跑得 168 层 / 12.55 MiB，比对要看 `engine_sha256`。
+
+测试规模 391 → **563** 条 pytest（W3b 新增 172 条：trt_infer 36 / make_calib_list 24 / build_trt 50 / bench_trt 62）。
+这 172 条一条都不需要装 tensorrt —— `import tensorrt` 全延迟到函数内，CI 只跑逻辑不跑 GPU。
 
 ## 许可与入库边界
 
