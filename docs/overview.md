@@ -131,9 +131,13 @@ NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清
 
 **② C++ 版：待做，且被本机工具链硬卡住**。TensorRT C++ API（engine 反序列化 → CUDA 流 →
 `cudaWarpAffine` 前处理 → 推理 → 后处理）+ CMake 工程 + 500 帧端到端压测（P50/P95 已在 ① 的 Python 侧
-量出来了，C++ 版要补的是 **P99** 与 `wait`/`busy` 拆分）。本机实测 `nvcc` / `cmake` / `cl` / `ninja` /
-`msbuild` 全部 not found，也没有 CUDA Toolkit 与 VS 安装目录；连 TensorRT 的**头文件和 import lib 都没有**
-（pip wheel 里 11 个 DLL、0 个 `.lib`）—— MSVC 链接期过不去，这一条比装编译器更卡人。
+量出来了，C++ 版要补的是 **P99** 与 `wait`/`busy` 拆分）。本机实测（2026-10-23 06:20，11:35 复核）：`cl` / `link` / `dumpbin` / `nvcc` 仍缺、无 VS 安装目录；
+`cmake` 4.4.4 与 `ninja` 1.13.2 已用 pip 装好，TensorRT 的**头文件已拿到**（v10.16 稀疏克隆，14 个头，
+放仓库外的 `_vendor\`，不入库），**import lib 仍然是 0 个**（pip wheel 里 11 个 DLL）—— MSVC 链接期过不去，
+这一条比装编译器更卡人。另一条复核结论省了 4 GB：实测 TRT 头对 CUDA **只有 1 处 `#include`**
+（`NvInferRuntimeBase.h:24` 的 `cuda_runtime_api.h`），所以不必装整个 CUDA Toolkit，
+conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage，实体包大小未验）就够；
+pip 的 `nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist（0.00 MB）**，此路不通。
 逐样怎么装、`.lib` 从哪来、装完按什么顺序做、拿什么判据验收，写在 [cpp_infer.md](cpp_infer.md)。
 ①的实测把 ② 的方向钉住了：含磁盘那轮的瓶颈是 **16~19 ms 的 CPU 前处理**（GPU 已能完全藏进去），
 所以 C++ 版真正要搬上 GPU 的是 letterbox，不是 NMS。

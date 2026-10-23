@@ -19,26 +19,34 @@ dtype / 激活内存）逐个问出来了，计划要用的 TensorRT C++ 符号�
 
 ---
 
-## 1. 本机现状（2026-10-23 06:20 实测）
+## 1. 本机现状（2026-10-23 06:20 实测，11:35 复核）
 
 | 组件 | 检查命令 | 结果 | 结论 |
 | --- | --- | --- | --- |
 | MSVC / VS | `Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"` | `False`；`C:\Program Files*\Microsoft Visual Studio` 目录不存在 | **缺**，没有 `cl.exe` 就没有 C++ |
 | CMake / Ninja | `where.exe cmake ninja`；`Test-Path W:\Anaconda\Library\bin\cmake.exe` | 全部 `False` | 当时缺，**06:18 已装好**（§2 S1） |
 | CUDA Toolkit | `Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"` | 目录不存在 | **缺**（没有 `nvcc`，也没有 `cuda_runtime.h`） |
-| CUDA 头文件 | 在 `W:\Anaconda\envs\induvision` 下递归搜 `cuda_runtime.h` | 0 命中 | **缺** |
+| CUDA 头文件 | 11:35 复核：5 个候选路径递归搜 `cuda_runtime.h` —— `C:\Program Files\NVIDIA GPU Computing Toolkit`（目录不存在）、`C:\Program Files\NVIDIA Corporation`、`W:\Anaconda\Library\include`、`W:\Anaconda\envs\induvision\Library\include`、torch 的 `include\` | **5 处全 0 命中** | **缺**，只能按 S3 补 |
 | CUDA 运行时 | `Get-ChildItem ...\torch\lib -Filter cu*.dll` | `cudart64_13.dll` 0.40 MB 在 | **不缺** —— torch 把 CUDA 13 运行时带进来了 |
 | TensorRT python | `import tensorrt; tensorrt.__version__` | `10.16.1.11` | 推理能跑（W3b/W4① 就是它） |
 | TensorRT 头文件 | 递归搜 `NvInfer.h` | 0 命中 | **缺** |
 | TensorRT import lib | `tensorrt_libs\*.lib` 计数 | **0**（同目录 11 个 DLL，`nvinfer_10.dll` 358.40 MB） | **缺**，MSVC 链接必须要它 |
 | winget | `winget --version` | `v1.29.380` | 可用，装东西走 winget |
-| 磁盘 | `(Get-PSDrive C).Free/1GB` | **177.7 GB** | 装得下，不是瓶颈 |
+| 磁盘 | `(Get-PSDrive C).Free/1GB` | **176.90 GB**（W 盘 284.90、G 盘 159.80；11:35 复核，06:20 那次是 177.7） | 装得下，不是瓶颈 |
+| 内存 | `(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory` | **15.22 GB** | 装 VS / CUDA 期间别同时跑压测 |
+| 编译器（11:35 复核） | `Get-Command nvcc,cl,link,dumpbin,gcc,g++` | **6 个全 NOT FOUND** | 见 S2。`conda` 在 `W:\Anaconda\Library\bin\conda.bat` |
+| CUDA 头 · pip 路 | `pip download nvidia-cuda-runtime-cu13 --no-deps` | **0.0.1 的 sdist 空壳，落盘 0.00 MB**，里头没有任何头文件 | **死路**，见 S3 |
+| CUDA 头 · conda 路 | `conda search --subdir win-64 -c conda-forge cuda-cudart-dev --info` | **13.4.92 命中，22 KB**（metapackage，实体在依赖 `cuda-cudart-dev_win-64`） | 可行，**实体包大小未验**，见 S3 |
 
 关键的一条是 **cudart 运行时不缺，缺的只是头和 import lib**。它决定了下面 §3 的取舍：
 本项目的 C++ 版**最小实现不需要 `nvcc`**，`cudaWarpAffine` / `cudaMemcpyAsync` / stream + event
 全是 cudart 的 C API，编译期只要 `cuda_runtime.h` + `cudart.lib`。
 只有要写自定义 kernel（把 letterbox + 归一化融成一个 kernel、掩码解码上 GPU）时才需要 nvcc。
 装 CUDA Toolkit 是为了头和 lib，**不是为了编译器**。
+
+**这条在 11:35 从推断升级成实测**：grep TRT v10.16 的 14 个头，对 CUDA 的 `#include` **只有 1 处**——
+`NvInferRuntimeBase.h:24 #include <cuda_runtime_api.h>`；`cudaStream_t` / `cudaError_t` 在头里出现
+**25 次**，全部由这一个 include 提供。结论：**S3 不需要 4 GB 的 Toolkit**，只要 cudart 的头和 lib。
 
 ---
 
@@ -69,20 +77,64 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --accept-sour
 
 winget 上当前版本 **17.14.42**。装完从"x64 Native Tools Command Prompt for VS 2022"进去，`cl` 才在 PATH 里。
 
-### S3 CUDA Toolkit（管理员，约 4 GB）
+**想少下一半**：把 `--includeRecommended` 去掉，只点编译器和 SDK 两个组件——
 
 ```powershell
-winget install --id Nvidia.CUDA --exact --accept-source-agreements
-nvcc --version
-Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\include\cuda_runtime.h"
+winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --accept-source-agreements `
+  --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
 ```
 
-winget 上当前是 **13.4**（只给最新版，不能选小版本）。版本口径：torch 是 `cu130`，
-TensorRT 10.16 支持 CUDA 13.x，**同大版本内 ABI 稳定**，13.4 的头配 13.0 的运行时正常能用。
-真在链接期报符号找不到，就去 NVIDIA 归档站装 13.0.x 的 exe（要手动选版本，winget 给不了）。
+体积从 3-7 GB 降到 **约 2-2.5 GB**（**这是估算，本机没实测过**：MSVC v143 工具集约 1.5 GB +
+Win11 SDK 约 0.8 GB）。省掉的是 CMake/Ninja 的 VS 集成、调试器、ATL —— 本项目用不到，
+CMake 和 Ninja 已经用 pip 装好了（S1）。
+**但 `VC.Tools.x86.x64` 这个组件不能省**：`cl` / `link` / `lib` / **`dumpbin`** 都在里头，
+S5(b) 从 DLL 合成 `.lib` 全靠 `dumpbin` 和 `lib`。
 
-更轻的备选（**未验证**，装之前先 `conda search` 确认有没有 win-64 包）：
-`conda install -n induvision -c nvidia cuda-cudart-dev` —— 只要头和 cudart 的 lib，不装 nvcc 和几百 MB 的样例。
+### S3 cudart 的头与 lib —— **原计划的 4 GB CUDA Toolkit 可以省掉**
+
+原计划是 `winget install Nvidia.CUDA`（约 4 GB）。2026-10-23 11:35 实测之后改了主意，依据三条：
+
+1. **TRT v10.16 的头对 CUDA 只有一处依赖**（实测 grep 14 个头，全仓仅一行）：
+   `NvInferRuntimeBase.h:24 #include <cuda_runtime_api.h>`；`cudaStream_t` / `cudaError_t`
+   出现 25 次，全部来自它。→ 编译期只要 `cuda_runtime_api.h` 那一族头 + `cudart.lib`，
+   Toolkit 里其余上千个头文件、几百 MB 的 samples、nvcc、nsight 全用不上。
+2. **运行期不缺**：torch 已经带了 `cudart64_13.dll`（§1 表）。
+3. **不写自定义 kernel 就不需要 nvcc**（§1 结尾）。
+
+所以 S3 的目标从「装 CUDA Toolkit」缩成「拿到 cudart 的头和 lib」。两条路都实测过了：
+
+| 路 | 实测结果（2026-10-23 11:35） | 结论 |
+| --- | --- | --- |
+| pip `nvidia-cuda-runtime-cu13` | `pip download --no-deps` 拿到的是 **0.0.1 的 sdist 空壳，落盘 0.00 MB**，无任何头文件 | **死路**。NVIDIA 在 PyPI 上没给 Windows 发实体 wheel（Linux 侧才有） |
+| conda `cuda-cudart-dev` | `conda search --subdir win-64 -c conda-forge --info` 命中 **13.4.92**，包体 **22 KB**，依赖 `cuda-cudart-dev_win-64 13.4.92` + `cuda-version >=13.4,<13.5.0a0` | **可行**。22 KB 是 metapackage，**实体包大小、是否含 `cudart.lib` 都还没验** |
+
+conda 那条，装之前先 `--dry-run` 看实体包多大：
+
+```powershell
+conda install -n induvision -c conda-forge "cuda-cudart-dev=13.4.92" --dry-run
+# 装完必须验这三样，缺一样就回退到 Toolkit
+Test-Path "W:\Anaconda\envs\induvision\Library\include\cuda_runtime_api.h"
+Get-ChildItem "W:\Anaconda\envs\induvision\Library\lib" -Filter "cudart*.lib"
+Get-ChildItem "W:\Anaconda\envs\induvision\Library\bin" -Filter "cudart64*.dll"
+```
+
+**一个没验的顾虑**：`W:\Anaconda` 是全机安装，往 `envs\induvision` 写文件**可能要管理员权限**。
+真弹 UAC，就建到用户目录去，只把路径传给 CMake，不动原环境：
+
+```powershell
+conda create -p "$env:USERPROFILE\envs\trtdev" -c conda-forge "cuda-cudart-dev=13.4.92" -y
+# CMake 侧：-DCUDAToolkit_INCLUDE_DIRS=...\Library\include -DCUDAToolkit_LIBRARY=...\lib\cudart.lib
+```
+
+版本口径：conda 上是 **13.4.92**，torch 是 `cu130`，TensorRT 10.16 支持 CUDA 13.x，
+**同大版本内 ABI 稳定**，13.4 的头配 13.0 的运行时正常能用。真在链接期报符号找不到，再退回重的：
+
+```powershell
+winget install --id Nvidia.CUDA --exact --accept-source-agreements   # 约 4 GB，需管理员
+Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\include\cuda_runtime_api.h"
+```
+
+winget 只给最新版 **13.4**，不能选小版本；要 13.0.x 得去 NVIDIA 归档站手动下 exe。
 
 ### S4 TensorRT 头文件（不用登录 NVIDIA 开发者站）
 

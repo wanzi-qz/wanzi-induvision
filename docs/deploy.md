@@ -517,9 +517,16 @@ W4 拆两步，**① Python 侧流水线已完成**：pinned memory 令牌池零
 
 数字、口径、掩码解码那个 bug 的全过程和读数陷阱都在 [pipeline.md](pipeline.md)，这里不重复。
 
-**② C++ 版还没做**，卡在本机工具链：`nvcc` / `cmake` / `cl`(MSVC) / `ninja` / `msbuild`
+**② C++ 版还没做**，卡在本机工具链（写这段时，2026-10-22）：`nvcc` / `cmake` / `cl`(MSVC) / `ninja` / `msbuild`
 全部 not found，也没有 CUDA Toolkit 与 Visual Studio 安装目录（TRT 是 pip wheel 装的，
 只带运行期 `.dll`，不带头文件与 `lib`）。要做 C++ 版得先装 VS Build Tools + CUDA Toolkit（数 GB）。
+
+> **2026-10-23 11:35 复核**：`cmake` 4.4.4 / `ninja` 1.13.2 已装好，TRT v10.16 的 14 个头已拿到
+> （稀疏克隆到仓库外的 `_vendor\`，不入库），`cl` / `link` / `dumpbin` / `nvcc` 仍缺。
+> 并且实测 TRT 头对 CUDA **只有 1 处 `#include`**（`NvInferRuntimeBase.h:24`），
+> **CUDA Toolkit 那 4 GB 可以省**，换成 conda `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage，
+> 实体包大小未验）；pip 的 `nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist（0.00 MB）**，此路不通。
+> 缺口清单、安装顺序与验收判据见 [cpp_infer.md](cpp_infer.md) §1 / §2。
 
 ② 的范围：`TensorRT C++ API`（engine 反序列化 → CUDA 流 → `cudaWarpAffine` 前处理 → 推理 →
 后处理）+ CMake 工程 + 500 张端到端 P50/P95 压测。等工具链装好再做，不预写命令 ——

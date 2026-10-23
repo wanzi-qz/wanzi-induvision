@@ -142,16 +142,22 @@ CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 Py
    Test-NetConnection www.baidu.com -Port 443 -InformationLevel Quiet
    # 2) 兄弟域名解析出的 IP 是通的 -> 问题在 DNS 给的这一个地址，不在链路
    Test-NetConnection codeload.github.com -Port 443 -InformationLevel Quiet
-   # 3) 用 curloptResolve 把域名钉到一个能连的 GitHub IP（下列 4 个本机实测均可连）
-   #    140.82.112.3 / 140.82.113.3 / 140.82.114.4 / 20.27.177.113
-   git -c http.https://github.com/.curloptResolve="github.com:443:140.82.112.3" push origin master
+   # 3) 用 curloptResolve 把域名钉到一个能连的 GitHub IP
+   #    2026-10-23 06:31 复测：140.82.112.3 **当天连不上了**（21051 ms 连接超时），
+   #    113.3 / 112.4 / 114.4 / 121.3 的 TCP 443 全 True。**IP 会失效，别把某一个当长期答案。**
+   #    坑：这 4 个 IP 的 **ICMP 全部 False**（GitHub 屏蔽 ping）。判活只能看 Test-NetConnection 的
+   #    TcpTestSucceeded，拿 PingSucceeded 判会误判成"整个 GitHub 挂了"。
+   git -c http.https://github.com/.curloptResolve="github.com:443:140.82.113.3" push origin master
    # 4) 想长期生效（写进 .git/config，只影响本仓库，不进版本库）
-   git config --local http.https://github.com/.curloptResolve "github.com:443:140.82.112.3"
+   git config --local http.https://github.com/.curloptResolve "github.com:443:140.82.113.3"
    # 5) 这个 IP 哪天失效了：换上面另一个，或删掉配置恢复默认 DNS
    git config --local --unset http.https://github.com/.curloptResolve
    ```
 
-   本仓库已按第 4 步设了 local 配置，所以直接 `git push` 就能过。
+   本仓库已按第 4 步设了 local 配置（**当前钉在 `140.82.113.3`**，2026-10-23 06:31 换的——
+   原先钉的 `140.82.112.3` 那天连不上了，换完 **3 秒推完**），所以直接 `git push` 就能过。
+   顺带记一条：`git push` 失败时先跑 `git status -sb`，`ahead N` 说明 commit 根本没上去，
+   别把"没推成"误读成"CI 没跑"（本轮就踩过：CI 查不到记录，原因是 commit 还在本地）。
    注：本机系统代理（`127.0.0.1:7897`）当时是关着的，git 也没配 `http.proxy`，
    所以别急着往代理方向查，先量端口。
 2. pip 一律加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`，实测延迟 209 ms。
@@ -159,6 +165,10 @@ CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 Py
    `cuda.is_available()` 立刻变 False。
 4. 显存只有 8 GB：训练用 YOLOv8s-seg、imgsz=640、batch 8~16 起步，不要上 l/x 型号。
 5. 磁盘余量：C 盘 186.7 GB，W 盘 287.3 GB（本环境装在 W 盘）。
+   **2026-10-23 11:35 复测：C 176.90 GB / W 284.90 GB / G 159.80 GB，物理内存 15.22 GB。**
+   C 盘比上次记的少了 9.8 GB，**没逐项归因**；能确定的只有仓库里的 `weights\`（三档 engine
+   合计 102.38 MB）和 `runs\`（压测 JSON 产物），两者都不入库，量级也不足以解释差额。
+   装 VS Build Tools（约 2 GB）之前先再量一次 C 盘。
 
 6. **Codex 桌面 App 重启会杀掉它 shell 派生的整棵子进程树**，WMI
    `Win32_Process.Create` 脱离也保不住（2026-10-22 04:12 实测，baseline15 练到

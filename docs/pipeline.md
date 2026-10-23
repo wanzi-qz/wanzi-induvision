@@ -40,6 +40,14 @@ W4 原计划直接上 C++。本机实测 `nvcc` / `cmake` / `cl`(MSVC) / `ninja`
 也没有 CUDA Toolkit 与 VS 安装目录 —— TensorRT 是 pip wheel 装的，只带运行期 `.dll`，
 不带头文件和 `lib`（详见 [deploy.md](deploy.md) §8.10）。装 VS Build Tools + CUDA Toolkit 是数 GB 的事。
 
+> **2026-10-23 11:35 复核更新**：`cmake` 4.4.4 与 `ninja` 1.13.2 已用 pip 装好，TRT v10.16 的
+> 14 个头也拿到了；`cl` / `link` / `dumpbin` / `nvcc` / `gcc` / `g++` 仍然全缺。同时实测到
+> **TRT 头对 CUDA 只有 1 处 `#include`**（`NvInferRuntimeBase.h:24` 的 `cuda_runtime_api.h`，
+> `cudaStream_t`/`cudaError_t` 25 次引用全部来自它），所以那「数 GB」里的 **CUDA Toolkit 可以省**，
+> 换成 conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage）；pip 的
+> `nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist（落盘 0.00 MB）**，此路不通。
+> 完整缺口清单见 [cpp_infer.md](cpp_infer.md) §1 / §2。
+
 但这一轮真正要验的工程要点跟语言无关：
 
 | 要点 | 语言相关吗 |
@@ -680,8 +688,12 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
 
 ## 9. W4② C++ 版还剩什么
 
-先说本机缺什么（实测，不是猜）：`nvcc` / `cmake` / `cl` / `ninja` / `msbuild` 全部 not found，
-无 CUDA Toolkit、无 VS 安装目录。要装 VS Build Tools（含 C++ 工作负载）+ CUDA Toolkit，数 GB。
+先说本机缺什么（2026-10-23 06:20 实测，11:35 复核，不是猜）：`cl` / `link` / `dumpbin` / `nvcc` /
+`gcc` / `g++` 6 个仍然全缺、无 VS 安装目录；`cmake` 4.4.4 + `ninja` 1.13.2 已用 pip 装好，
+TRT v10.16 的 14 个头已拿到。原以为要装 VS Build Tools + CUDA Toolkit 数 GB —— 复核之后
+**CUDA Toolkit 那 4 GB 可以省**：实测 TRT 头对 CUDA 只有 1 处 `#include`（`NvInferRuntimeBase.h:24`），
+conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage）就够；pip 的
+`nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist**，此路不通。剩下的 MSVC 那约 2 GB 省不掉。
 **逐样东西怎么装、TensorRT 的头与 `.lib` 从哪来（pip wheel 里 0 个 `.lib`）、装完按什么顺序做、
 拿什么判据验收，全部写在 [cpp_infer.md](cpp_infer.md)** —— 本节只留方向。
 
