@@ -225,12 +225,12 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 ## 3. 装完做什么（按性价比排序，对齐 [pipeline.md](pipeline.md) §9）
 
 > **2026-10-23 实测更新：第 1~4 条已全部做完，结果与判据逐条落在
-> [cpp_bench.md](cpp_bench.md)**——四层对拍 A/B/C 逐位或逐项相等（前处理张量逐位相等、后处理
-> 移植 20/20 帧全 tuple 相等）、D 检测级 match_rate 1.0000 / 框 IoU 0.9967（掩码用像素数代理，
-> 严格 IoU 未算）、500 帧全等 n_diff=0、流水线 59.5/61.6 FPS
-> （比 Python 同口径 fp16 +31~36%，P50 5.3×）；加速比 1.23× 未达下面第 4 条对应的
-> 1.44× 判据，口径分析在 cpp_bench.md §3.1。第 5 条（nvJPEG/GPU 解码）是
-> 实测出的下一个台阶。
+> [cpp_bench.md](cpp_bench.md)**——对拍 A/B/C 逐位或逐项相等（前处理张量逐位相等、后处理
+> 移植 20/20 帧全 tuple 相等）、C2/D 掩码位图 IoU min 0.9972（判据 0.85，`--dump-masks`
+> 真位图口径）、D 检测级 match_rate 1.0000 / 框 IoU 0.9967、500 帧全等 n_diff=0、
+> 流水线 59.5/61.6 FPS（比 Python 同口径 fp16 +31~36%，P50 5.3×）；
+> 加速比 1.23× 未达下面第 4 条对应的 1.44× 判据，口径分析在 cpp_bench.md §3.1。
+> 第 5 条（nvJPEG/GPU 解码）是实测出的下一个台阶。
 
 1. **前处理搬上 GPU**：`cudaWarpAffine` 一次做完 letterbox 的缩放 + pad。**但先看
    [gpu_preproc.md](gpu_preproc.md) 的实测分解**：那 16~19 ms 里 imdecode 占 ~15 ms、
@@ -256,9 +256,9 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 
 ## 4. 验收判据（基线数字全部来自 pipeline.md §6.5，同清单同口径，一条都不松）
 
-> **2026-10-23 实测**：match_rate 1.0000 / 框 IoU min 0.9967 / 500 帧全等
-> n_diff=0 / P50·P95·P99 已补 —— 全过；**掩码那一条只做了像素数代理、严格 IoU 未算**
-> （C++ 侧 `Det` 不传掩码位图，缺口见 cpp_bench.md §2.1），引用时别写成"掩码 IoU 已验"；
+> **2026-10-23 实测**：match_rate 1.0000 / 框 IoU min 0.9967 / **掩码位图 IoU
+> 逐帧均值 min 0.9972（`--dump-masks` 真位图口径，2026-10-23 晚补齐，见 cpp_bench.md
+> §2.2）** / 500 帧全等 n_diff=0 / P50·P95·P99 已补 —— 全过；
 > 唯一未达标的是加速比 1.23× < 1.44×（口径分析：cpp_bench.md §3.1，serial 基线被 C++ 强化后
 > Amdahl 上限压住了比值，收益实际落在 P50 5.3× 与吞吐 +23%）。完整数字见 [cpp_bench.md](cpp_bench.md)。
 

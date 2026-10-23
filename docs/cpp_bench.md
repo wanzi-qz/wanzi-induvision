@@ -5,12 +5,12 @@
 > 实测与估算分开标注，与 W4① 的老规矩一致。
 
 一句话：**C++ 版全链路（imdecode → GPU letterbox → TRT → CPU 后处理）打通，
-四层对拍 A/B/C 三层逐位或逐项相等、D 层检测级 match_rate 1.0000 / 框 IoU 0.9967，
-500 帧 serial vs pipeline 全等 n_diff=0；流水线 59.47 FPS（另一轮 61.59），
-比 Python 同口径快 31~36%，P50 21.8 → 4.1 ms（5.3×）。加速比 1.23× 未达 §4 的
-1.44× 判据，原因与口径分析见 §3——这条如实报告，不改判据。
-掩码那条判据用的是像素数代理、不是严格 IoU，口径缺口写在 §2.1（不补这个洞，
-"四层全过"这句话就是虚的）。**
+对拍 A/B/C 三层逐位或逐项相等、C2/D 掩码位图 IoU min 0.9972（判据 0.85），
+D 层检测级 match_rate 1.0000 / 框 IoU 0.9967，500 帧 serial vs pipeline 全等
+n_diff=0；流水线 59.47 FPS（另一轮 61.59），比 Python 同口径快 31~36%，
+P50 21.8 → 4.1 ms（5.3×）。加速比 1.23× 未达 §4 的 1.44× 判据，原因与口径分析
+见 §3——这条如实报告，不改判据。掩码 IoU 起初只做了像素数代理（原 §2.1），
+2026-10-23 晚已补齐为真位图 IoU，见 §2.2。**
 
 ---
 
@@ -20,7 +20,7 @@
 | --- | --- |
 | `cpp/src/preproc.cu` | 融合 kernel：BGR→RGB + /255 + bilinear(align_corners=False) + pad 114，直接写 engine 输入 device 缓冲（**没有 Python 版那笔 4.688 MiB D2H**，预研文档说的"保守下界"差距就在这） |
 | `cpp/src/postproc.cpp/.h` | `pipeline.py::postprocess` 一族的逐条移植（sigmoid / batched_nms / scale_boxes / masks_from_proto），掩码 upsample 用与 Python 同一个 `cv2.resize` 算法 |
-| `cpp/src/bench.cpp` | serial + 三线程流水线（环形队列 + slot 池 pinned + event），`--dump-preproc/--dump-outs/--dump-dets` 三个对拍探针 |
+| `cpp/src/bench.cpp` | serial + 三线程流水线（环形队列 + slot 池 pinned + event），`--dump-preproc/--dump-outs/--dump-dets/--dump-masks` 四个对拍探针 |
 | `tools/check_cpp_bench.py` | Python 侧对拍器 + 资源采样（nvidia-smi 200ms + psutil，prof.py 口径） |
 | `cpp/build.bat` / `CMakeLists.txt` | nvcc 单 TU 编译 + 显式 MSVC/SDK 环境（不调 vcvars，见 cpp_infer.md §2） |
 
@@ -33,19 +33,23 @@
 | A | decode：C++ `imdecode` vs Python `cv2` | 逐字节一致 | **5/5** | PASS |
 | B | 前处理：C++ kernel vs Python `GpuPreproc` | max_abs / cosine | **max_abs = 0，cosine = 1.0（逐位相等）** | PASS |
 | C | 后处理移植：同一份 engine 输出 bin 喂两边 | score/cls/box/mask_pixels 全 tuple 相等 | **20/20** | PASS |
-| D | 检测级：C++ dets vs Python 全链路 | match_rate ≥ 0.98、框 IoU ≥ 0.99、掩码 IoU ≥ 0.85 | match_rate **1.0000**，框 IoU min **0.9967**（30 帧 / 13 个检出） | PASS（掩码那条用像素数代理，见 §2.1） |
+| C2 | 掩码位图：C++ `--dump-masks` vs Python，同 bin 同帧 | 掩码 IoU ≥ 0.85 | **1 对，IoU = 1.0000**（前 3 帧仅 1 个检出，全量在 D 层） | PASS |
+| D | 检测级：C++ dets vs Python 全链路 | match_rate ≥ 0.98、框 IoU ≥ 0.99、掩码 IoU ≥ 0.85 | match_rate **1.0000**，框 IoU min **0.9967**，**掩码 IoU 逐帧均值 min 0.9972 / mean 0.9995**（30 帧 / 13 个检出） | PASS（掩码为真位图口径，见 §2.2） |
 
 B 层的逐位相等值得多说一句：kernel 按 torch `upsample_bilinear2d` 的实现逐项
 复刻（源坐标 `(dst+0.5)*in/out-0.5` 负值夹 0、四邻线性组合的浮点顺序、先 /255
 再插值），比路线 C 预研里 cv2-vs-torch 的 max_abs 0.00350 还干净——那 0.0035
 本来就是 uint8 域插值与 float 域插值的口径差，不是不可消除的。
 
-D 层掩码像素数：30 帧里 24 帧**计数完全相等**（其中 21 帧无检出），6 帧差
-**±1~14 px（±0.04%）**——跨运行时（numpy SIMD vs C++ 标量）1ulp 级别落在 0.5
-阈值边界的翻转，量级在"边界 1~2 px"口径内。注意这里比的是**计数**不是掩码位图，
-严格 IoU 的口径缺口见 §2.1。
+D 层掩码（§2.2 的真位图口径）：13 个检出贪心配对全配上，逐帧均值 IoU 最低
+**0.9972**、全体均值 **0.9995**；30 帧里 24 帧像素数完全相等（其中 21 帧无检出），
+6 帧差 ±1~14 px（±0.04%）——numpy SIMD vs C++ 标量的 1ulp 落在 0.5 阈值边界的
+翻转，与位图 IoU 的数字互相印证。
 
-### 2.1 口径缺口：严格掩码 IoU 没算，用的是像素数代理（如实标注）
+### 2.1 口径缺口：严格掩码 IoU 没算，用的是像素数代理（历史记录，已由 §2.2 填补）
+
+> **2026-10-23 晚补记**：本节描述的缺口当天已填补（`--dump-masks` 探针 +
+> 真位图 IoU），实测见 §2.2。原文保留，作为"先如实标注、再补齐"的记录。
 
 §4 判据第三条写的是"掩码 IoU ≥ 0.85"，但 C++ 侧的 `Det` 只带 `mask_pixels`
 （一个计数），**不传 810 KB/帧的 bool 掩码**——`det_json()` 落盘的检测记录里没有
@@ -57,10 +61,29 @@ D 层掩码像素数：30 帧里 24 帧**计数完全相等**（其中 21 帧无
 
 **这不等于 IoU 已验。** 由"差 ≤14 px / 最大的掩码 69915 px"反推，IoU 至少是
 0.9996 量级，但这是**推算不是实测**，按本仓库的规矩不能写进结论表当 PASS 的依据。
-要补齐只需两步：给 `postproc` 的 `need_masks` 分支加一个可选的掩码输出指针、
-`bench --dump-dets` 时按 `frame_idx/det_idx` 落 `uint8` 掩码，再由
-`tools/check_cpp_bench.py` 在同 30 帧上算逐检出 IoU。工作量约 1 小时，
-**没做，所以不宣称**。
+
+### 2.2 掩码位图 IoU：缺口已补齐（2026-10-23 晚）
+
+按 §2.1 预告的两步补齐，做法与结果：
+
+- **C++ 侧**：`Det` 加可选掩码位图（`mask`/`mask_h`/`mask_w`，orig_h×orig_w 的
+  0/1 uint8），`postprocess` 加 `want_bitmap` 参数；`bench` 加第四个探针
+  `--dump-masks N`——压测前独立跑一遍前 N 帧，dets + 位图按序拼进
+  `{fi}_masks.bin` + `{fi}_maskdets.json` 落盘。位图不进压测热路径（每检出
+  ~0.8 MB，且污染计时），退化情况写全 0 位图对齐 Python 的 `full=np.zeros`。
+- **Python 侧**：`check_cpp_bench.py` 新增 `_load_mask_dump` /
+  `_bench_masks_for_first_frames`；C 层升级出 **C2**（同 bin 同帧的位图 IoU，
+  且先验 `--dump-masks` 轮与 `--dump-dets` 轮 dets 逐位一致才承认"同 bin"）；
+  D 层改用 `match_detections(with_mask=True)` 出真掩码 IoU。
+- **结果**（`runs/logs/cpp_bench_maskiou.json`）：D 层 30 帧 / 13 个检出，
+  掩码 IoU 逐帧均值 **min 0.9972 / mean 0.9995 / max 1.0000**，判据 0.85
+  **PASS**；C2 同 bin 逐位级 1.0000。同轮 500 帧 checksum（dets 270 /
+  mask_pixels 4803010 / score_sum 168.9960）与 §3 的原报告**逐位一致**
+  ——位图改动对热路径零回归，顺带第三次验证了推理确定性。
+
+残留的口径说明：掩码 IoU 与 ultralytics 口径（W4① 的 0.910~0.916）不可比——
+那是对"整图放大"的参照实现，这是对"裁剪小块放大"的 C++ 移植，两边算法相同，
+只剩跨运行时 1ulp 边界翻转，所以数字接近 1 是预期而非异常。
 
 ## 3. 压测结果（500 items = 50 帧 × 10 repeats，fp16，capacity 4）
 

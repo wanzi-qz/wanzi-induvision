@@ -72,16 +72,23 @@ void nms_one_class(std::vector<int>& order, const std::vector<Cand>& cs,
 
 // ---- pipeline.masks_from_proto（裁剪小块再放大，不是整图放大）
 // 返回该检测的掩码像素数；退化情况（框在网格外）返回 0，不抛异常。
+// bitmap 非空时额外写 (orig_h, orig_w) 的 0/1 位图（退化情况写全 0，
+// 对齐 Python 的 full=np.zeros —— 两侧"空掩码"口径一致，IoU 才可比）。
 // coeffs 指向该 anchor 的第一个系数（out0[(4+nc)*anchors + k]），沿属性维的
 // 步长是 coeff_stride（= anchors）—— out0 是 (attrs, anchors) 行主序，
 // 这里步长写错过一版，帧 0 的掩码直接差 22 倍，别再"顺手"改回连续读。
-int mask_pixel_count(const float* proto, int c, int mh, int mw,
-                     const double box640[4], const float* coeffs,
-                     int coeff_stride, const LetterboxMeta& lb, double mask_thr) {
+int mask_decode(const float* proto, int c, int mh, int mw,
+                const double box640[4], const float* coeffs,
+                int coeff_stride, const LetterboxMeta& lb, double mask_thr,
+                std::vector<uint8_t>* bitmap) {
+  const int oh = lb.orig_h, ow = lb.orig_w;
+  const auto zero_bitmap = [&]() {
+    if (bitmap) bitmap->assign(static_cast<size_t>(oh) * ow, 0);
+    return 0;
+  };
   const double scale = static_cast<double>(lb.imgsz) / static_cast<double>(mh);
   const double inv = 1.0 / lb.ratio;
   const double dw = lb.dw, dh = lb.dh;
-  const int oh = lb.orig_h, ow = lb.orig_w;
 
   const double x1 = box640[0] / scale, y1 = box640[1] / scale;
   const double x2 = box640[2] / scale, y2 = box640[3] / scale;
@@ -90,7 +97,7 @@ int mask_pixel_count(const float* proto, int c, int mh, int mw,
     return std::min(std::max(static_cast<int>(std::floor(v + 0.5)), 0), lim);
   };
   const int cx1 = g(x1, mw), cy1 = g(y1, mh), cx2 = g(x2, mw), cy2 = g(y2, mh);
-  if (cx2 <= cx1 || cy2 <= cy1) return 0;
+  if (cx2 <= cx1 || cy2 <= cy1) return zero_bitmap();
 
   const int cw = cx2 - cx1, chh = cy2 - cy1;  // 裁剪区网格尺寸
   // m = sigmoid(cf @ crop)：float32 口径。np 的 float32 matmul 有 SIMD 分块，
@@ -114,7 +121,7 @@ int mask_pixel_count(const float* proto, int c, int mh, int mw,
   const int py1 = static_cast<int>(py_round((cy1 * scale - dh) * inv));
   const int dx1 = std::max(px1, 0), dy1 = std::max(py1, 0);
   const int dx2 = std::min(px1 + tw, ow), dy2 = std::min(py1 + th, oh);
-  if (dx2 <= dx1 || dy2 <= dy1) return 0;
+  if (dx2 <= dx1 || dy2 <= dy1) return zero_bitmap();
 
   // cv2.resize INTER_LINEAR：与 Python 同一算法（float32 域）
   const cv::Mat src(chh, cw, CV_32F, m.data());
@@ -142,10 +149,21 @@ int mask_pixel_count(const float* proto, int c, int mh, int mw,
   const int sx1 = dx1 - px1, sy1 = dy1 - py1;
   const int ww = dx2 - dx1, hh = dy2 - dy1;
   int cnt = 0;
-  for (int yy = 0; yy < hh; ++yy) {
-    const float* row = up.ptr<float>(sy1 + yy) + sx1;
-    for (int xx = 0; xx < ww; ++xx)
-      if (row[xx] >= mask_thr) ++cnt;
+  if (bitmap) {
+    bitmap->assign(static_cast<size_t>(oh) * ow, 0);
+    uint8_t* bm = bitmap->data();
+    for (int yy = 0; yy < hh; ++yy) {
+      const float* row = up.ptr<float>(sy1 + yy) + sx1;
+      uint8_t* brow = bm + static_cast<size_t>(dy1 + yy) * ow + dx1;
+      for (int xx = 0; xx < ww; ++xx)
+        if (row[xx] >= mask_thr) { brow[xx] = 1; ++cnt; }
+    }
+  } else {
+    for (int yy = 0; yy < hh; ++yy) {
+      const float* row = up.ptr<float>(sy1 + yy) + sx1;
+      for (int xx = 0; xx < ww; ++xx)
+        if (row[xx] >= mask_thr) ++cnt;
+    }
   }
   return cnt;
 }
@@ -166,7 +184,8 @@ std::vector<Det> postprocess(const float* out0, int attrs, int anchors,
                              const float* out1, int proto_c, int proto_h,
                              int proto_w, const LetterboxMeta& lb,
                              double conf_thr, double iou_thr, int max_det,
-                             double mask_thr, bool need_masks) {
+                             double mask_thr, bool need_masks,
+                             bool want_bitmap) {
   const int nc = attrs - 4 - proto_c;
   if (nc <= 0) return {};
 
@@ -235,9 +254,10 @@ std::vector<Det> postprocess(const float* out0, int attrs, int anchors,
     d.score = static_cast<double>(c.score);
     d.cls = c.label;
     if (need_masks) {
-      d.mask_pixels = mask_pixel_count(out1, proto_c, proto_h, proto_w,
-                                       c.box, c.coeffs, c.coeff_stride, lb,
-                                       mask_thr);
+      d.mask_pixels = mask_decode(out1, proto_c, proto_h, proto_w,
+                                  c.box, c.coeffs, c.coeff_stride, lb,
+                                  mask_thr, want_bitmap ? &d.mask : nullptr);
+      if (want_bitmap) { d.mask_h = lb.orig_h; d.mask_w = lb.orig_w; }
     }
     // 减浮点半 pad（不是 top/left！），除 ratio，按原图 clip —— 逐行对齐
     d.box[0] = std::clamp((c.box[0] - lb.dw) / lb.ratio, 0.0, static_cast<double>(lb.orig_w));

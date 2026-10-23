@@ -15,6 +15,9 @@
 //   --dump-preproc N 前 N 帧：原始 BGR bin + (1,3,640,640) float bin + lb meta
 //   --dump-outs     N 前 N 帧：out0/out1 bin + lb meta（后处理移植等价性检验）
 //   --dump-dets     N 前 N 帧：完整检测记录（match_rate / IoU 对拍用）
+//   --dump-masks    N 前 N 帧：检测 + 掩码位图落盘（真掩码 IoU 对拍用）——
+//                   独立于压测循环，压测前跑一遍（同输入下 engine 输出确定，
+//                   与压测轮 dets 逐位一致）；压测热路径不碰位图。
 #include <cuda_runtime_api.h>
 #include <NvInfer.h>
 
@@ -278,6 +281,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stderr, nullptr, _IONBF, 0);
   std::string engine_path, list_path, json_out, dump_dir, mode = "pipeline";
   int repeats = 2, capacity = 4, dump_preproc = 0, dump_outs = 0, dump_dets = 0;
+  int dump_masks = 0;
   int imgsz = 640;
   double conf_thr = 0.25, iou_thr = 0.7, mask_thr = 0.5;
   int max_det = 300;
@@ -303,6 +307,7 @@ int main(int argc, char** argv) {
     else if (a == "--dump-preproc") { dump_preproc = std::stoi(next("--dump-preproc")); }
     else if (a == "--dump-outs") { dump_outs = std::stoi(next("--dump-outs")); }
     else if (a == "--dump-dets") { dump_dets = std::stoi(next("--dump-dets")); }
+    else if (a == "--dump-masks") { dump_masks = std::stoi(next("--dump-masks")); }
     else if (a == "--dump-dir") dump_dir = next("--dump-dir");
     else if (a == "--json-out") json_out = next("--json-out");
     else if (a == "--mode") mode = next("--mode");
@@ -521,6 +526,71 @@ int main(int argc, char** argv) {
     }
   };
 
+  // --dump-masks：前 N 帧的 dets + 掩码位图落盘（真掩码 IoU 对拍用）。
+  // 与 probe_dump 同理放压测外：位图每检出 ~0.8 MB，进热路径既污染计时又吃内存。
+  // 推理是确定的（同输入同输出，500 帧全等已验过），这里算出的 dets 与压测轮一致。
+  auto mask_dump = [&](int n) {
+    if (n <= 0) return;
+    std::filesystem::create_directories(std::filesystem::u8path(dump_dir));
+    for (int fi = 0; fi < n && fi < n_frames; ++fi) {
+      const auto raw = read_file(*frames[fi].path);
+      cv::Mat img = cv::imdecode(cv::Mat(1, static_cast<int>(raw.size()), CV_8U,
+                                         const_cast<uint8_t*>(raw.data())),
+                                 cv::IMREAD_COLOR);
+      if (img.empty()) die("imdecode 失败：" + *frames[fi].path);
+      const auto lb = letterbox_meta(img.cols, img.rows, imgsz);
+      Slot& s = pool.at(0);
+      std::memcpy(s.pin_in, img.data,
+                  static_cast<size_t>(img.rows) * img.cols * 3);
+      CUDA_CHECK(cudaMemcpyAsync(d_img, s.pin_in,
+                                 static_cast<size_t>(img.rows) * img.cols * 3,
+                                 cudaMemcpyHostToDevice, stream));
+      launch_preproc(d_img, img.cols, img.rows, d_in, lb, stream);
+      if (!ctx->enqueueV3(stream)) die("enqueueV3 失败");
+      CUDA_CHECK(cudaMemcpyAsync(s.pin_out0, d_o0, o0_bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(s.pin_out1, d_o1, o1_bytes,
+                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      auto dets = induvision::postprocess(s.pin_out0, attrs, anchors,
+                                          s.pin_out1, proto_c, proto_h,
+                                          proto_w, lb, conf_thr, iou_thr,
+                                          max_det, mask_thr, true, true);
+      // 掩码 bin：按 dets 顺序拼接 uint8 位图（每张 orig_h×orig_w）；
+      // offsets 只是校验用——位图等长，顺序拼接即可 reshape。
+      std::vector<uint8_t> mb;
+      std::vector<long long> offs;
+      for (const auto& d : dets) {
+        offs.push_back(static_cast<long long>(mb.size()));
+        if (static_cast<int>(d.mask.size()) != lb.orig_h * lb.orig_w)
+          die("掩码位图尺寸与原图不符");
+        mb.insert(mb.end(), d.mask.begin(), d.mask.end());
+      }
+      char nm[80];
+      std::snprintf(nm, sizeof(nm), "%05d_masks.bin", fi);
+      write_file(dump_dir + "/" + nm, mb.data(), mb.size());
+      Json j;
+      j.s = "{";
+      j.kv("h", lb.orig_h, false); j.kv("w", lb.orig_w);
+      j.kv("n", static_cast<int>(dets.size()));
+      j.s += ",\"offsets\":[";
+      for (size_t k = 0; k < offs.size(); ++k) {
+        if (k) j.s += ",";
+        j.s += std::to_string(offs[k]);
+      }
+      j.s += "],\"dets\":[";
+      for (size_t k = 0; k < dets.size(); ++k) {
+        if (k) j.s += ",";
+        j.s += det_json(dets[k]);
+      }
+      j.s += "]}";
+      std::snprintf(nm, sizeof(nm), "%05d_maskdets.json", fi);
+      write_file(dump_dir + "/" + nm, j.s.data(), j.s.size());
+      std::printf("[dump ] 帧 %d 掩码已落盘（%d 检出，%zu B）\n",
+                 fi, static_cast<int>(dets.size()), mb.size());
+    }
+  };
+
   // ================================================================ pipeline
   Ring<PostTask> q1(static_cast<size_t>(capacity)), q2(static_cast<size_t>(capacity));
   Ring<FrameResult> q3(static_cast<size_t>(capacity) * 2);
@@ -613,10 +683,11 @@ int main(int argc, char** argv) {
 
   // ---- dump 探针（压测前做一次，不污染计时）
   probe_dump(dump_preproc, dump_outs);
+  mask_dump(dump_masks);
 
   // ---- 跑
   const auto wall0 = std::chrono::steady_clock::now();
-  if (dump_preproc > 0 || dump_outs > 0) {
+  if (dump_preproc > 0 || dump_outs > 0 || dump_masks > 0) {
     std::puts("[mode ] 探针模式：不跑压测（探针在 serial 语义下落盘）");
   } else if (mode == "serial") {
     run_serial(0);
@@ -650,7 +721,8 @@ int main(int argc, char** argv) {
   Json j;
   j.s = "{";
   j.kv_str("schema", "induvision.cpp_bench.v1", false);
-  j.kv_str("mode", (dump_preproc > 0 || dump_outs > 0) ? "probe" : mode);
+  j.kv_str("mode", (dump_preproc > 0 || dump_outs > 0 || dump_masks > 0)
+                       ? "probe" : mode);
   j.kv_str("engine", engine_path);
   j.kv("repeats", repeats);
   j.kv("capacity", capacity);

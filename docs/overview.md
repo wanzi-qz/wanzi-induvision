@@ -261,13 +261,15 @@ GPU util A 组只有 **28~37%**（与 TensorRT 侧 infer util 0.33~0.46 两个�
 | A | decode：C++ `imdecode` vs Python `cv2` | 逐字节一致 | **5/5** |
 | B | 前处理：融合 kernel vs Python `GpuPreproc` | max_abs / cosine | **max_abs 0 / cosine 1.0（逐位相等）** |
 | C | 后处理：同一份 engine 输出喂两边 | score/cls/box/mask_pixels 全 tuple 相等 | **20/20 帧** |
-| D | 检测级：C++ vs Python 全链路 | match_rate ≥0.98、框 IoU ≥0.99 | **1.0000 / min 0.9967**（13 个检出全配上） |
+| C2 | 掩码位图：C++ `--dump-masks` vs Python（同 bin 同帧） | 掩码 IoU ≥0.85 | **1.0000**（前 3 帧仅 1 检出，全量在 D） |
+| D | 检测级：C++ vs Python 全链路 | match_rate ≥0.98、框 IoU ≥0.99、掩码 IoU ≥0.85 | **1.0000 / min 0.9967 / 掩码 IoU 逐帧均值 min 0.9972**（13 个检出全配上） |
 
 B 层的逐位相等是复刻出来的，不是碰巧：kernel 按 torch `upsample_bilinear2d` 逐项实现
 （源坐标 `(dst+0.5)*in/out-0.5` 负值夹 0、四邻线性组合的浮点顺序、先 /255 再插值），
-所以比路线 C 预研里 cv2-vs-torch 的 max_abs 0.00350 更干净。D 层掩码那条目前用
-**像素数代理**（30 帧 24 帧计数相等，6 帧差 ±1~14 px ≈ 0.04%），严格掩码 IoU 尚未单独计算 ——
-C++ 侧 `Det` 只传计数不传掩码位图，缺口和补法写在 cpp_bench.md §2.1，**没有算就不宣称**。
+所以比路线 C 预研里 cv2-vs-torch 的 max_abs 0.00350 更干净。D 层掩码那条起先用
+**像素数代理**（30 帧 24 帧计数相等，6 帧差 ±1~14 px ≈ 0.04%），当天已补齐为真位图
+IoU（`--dump-masks` 探针）：逐帧均值 **min 0.9972 / mean 0.9995**，判据 0.85 过线；
+代理阶段的历史记录与补法见 cpp_bench.md §2.1 / §2.2。
 
 | 指标 | C++ serial | C++ pipeline | Python 同口径（fp16，A 组） |
 | --- | --- | --- | --- |

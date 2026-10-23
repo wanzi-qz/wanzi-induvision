@@ -6,6 +6,7 @@
 // 每一处与 Python 版的数值口径差异都在实现处用注释钉住；不允许"顺手优化"。
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 namespace induvision {
@@ -22,22 +23,31 @@ struct LetterboxMeta {
   double ratio = 1.0;
 };
 
-// 一个检测结果（对齐 pipeline.Detection；掩码只留像素数——压测不传 810KB 的 bool）。
+// 一个检测结果（对齐 pipeline.Detection）。
 struct Det {
   double score = 0.0;
   int cls = 0;
   double box[4] = {0, 0, 0, 0};  // xyxy，原图坐标
   int mask_pixels = 0;
+  // 掩码位图（仅掩码对拍路径填充；want_bitmap=false 时保持为空）：
+  // mask_h × mask_w 行主序 0/1，语义同 pipeline.Detection.mask 的 bool。
+  // 压测热路径别开——每个检出 ~0.8 MB（1024² 原图）。
+  std::vector<uint8_t> mask;
+  int mask_h = 0, mask_w = 0;
 };
 
 // out0: (attrs, anchors) float32，行主序（out0[a*anchors + k] = 第 a 属性第 k 锚点）
 // out1: (proto_c, proto_h, proto_w) float32，prototype
+// need_masks=false 时完全跳过掩码解码（与 pipeline.postprocess 的 need_masks 同义）；
+// want_bitmap=true 时额外把每个检出的 (orig_h, orig_w) 位图写进 Det::mask
+// （此时 need_masks 必须为 true）。
 // 返回按分数降序、截断 max_det 的检测（对齐 postprocess 的输出顺序）。
 std::vector<Det> postprocess(const float* out0, int attrs, int anchors,
                              const float* out1, int proto_c, int proto_h,
                              int proto_w, const LetterboxMeta& lb,
                              double conf_thr, double iou_thr, int max_det,
-                             double mask_thr, bool need_masks);
+                             double mask_thr, bool need_masks,
+                             bool want_bitmap = false);
 
 // Python 的 round() 是银行家舍入（round-half-to-even），C++ std::round 是
 // 半远离零。masks_from_proto 里有三处 round()，.5 恰好出现时会差 1 像素，

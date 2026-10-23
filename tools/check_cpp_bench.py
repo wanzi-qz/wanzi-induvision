@@ -209,6 +209,7 @@ def run_probe(args: argparse.Namespace, exe: Path, frames: List[str],
     dets_cpp = _bench_dets_for_first_frames(args, exe, frames, imgsz,
                                             n=args.dump_outs)
     c_rows = []
+    dets_py_by_frame: List[Any] = []
     for fi in range(args.dump_outs):
         meta = json.loads((dump_dir / f"{fi:05d}_io_meta.json").read_text(encoding="utf-8"))
         out0 = np.frombuffer((dump_dir / f"{fi:05d}_out0.bin").read_bytes(),
@@ -221,6 +222,7 @@ def run_probe(args: argparse.Namespace, exe: Path, frames: List[str],
                               out1.reshape(1, 32, 160, 160), lb,
                               conf_thr=args.conf_thr, iou_thr=args.iou_thr,
                               max_det=args.max_det, mask_thr=args.mask_thr)
+        dets_py_by_frame.append(dets_py)
         py_sum = [(round(d.score, 6), int(d.cls),
                    [round(v, 3) for v in d.box],
                    int(np.count_nonzero(d.mask))) for d in dets_py]
@@ -238,6 +240,43 @@ def run_probe(args: argparse.Namespace, exe: Path, frames: List[str],
         "verdict": "PASS" if all(r["identical"] for r in c_rows) else "CHECK"}
     print(f"[C    ] 后处理移植等价性：{sum(r['identical'] for r in c_rows)}/"
           f"{len(c_rows)} 帧逐项相等（score/cls/box/mask_pixels 全 tuple 相等）")
+
+    # ---- C2：掩码位图 IoU（同一批帧，C++ --dump-masks 位图 vs Python 掩码）。
+    # C 层 tuple 全等已钉死两边检出同序，这里按下标逐对算，能看到最差那一对。
+    from induvision.pipeline import mask_iou  # noqa: PLC0415
+    masks_cpp = _bench_masks_for_first_frames(args, exe, frames, imgsz,
+                                              n=args.dump_outs)
+    ious_all: List[float] = []
+    for fi in range(args.dump_outs):
+        cpp_info = masks_cpp[str(fi)]
+        # --dump-masks 轮与 --dump-dets 轮是两次独立推理，先验"dets 仍逐位一致"，
+        # 否则"同 bin"的说法就不成立，IoU 白算。
+        t_new = [(round(d["score"], 6), int(d["cls"]),
+                  [round(v, 3) for v in d["box"]],
+                  int(d["mask_pixels"])) for d in cpp_info["dets"]]
+        t_ref = [(round(d["score"], 6), int(d["cls"]),
+                  [round(v, 3) for v in d["box"]],
+                  int(d["mask_pixels"])) for d in dets_cpp.get(str(fi), [])]
+        if t_new != t_ref:
+            raise ValueError(f"帧 {fi} --dump-masks 轮与 --dump-dets 轮 dets "
+                             f"不一致，engine 输出确定性被破坏，掩码 IoU 不可信")
+        dets_py = dets_py_by_frame[fi]
+        if len(cpp_info["dets"]) != len(dets_py):
+            raise ValueError(f"帧 {fi} 检出数不一致：py {len(dets_py)} vs cpp "
+                             f"{len(cpp_info['dets'])}（C 层 tuple 等价性被破坏？）")
+        for k in range(len(dets_py)):
+            ious_all.append(float(mask_iou(dets_py[k].mask,
+                                           cpp_info["masks"][k])))
+    report["layers"]["C2_mask_iou"] = {
+        "n_frames": args.dump_outs, "n_pairs": len(ious_all),
+        "mean": round(float(np.mean(ious_all)), 6) if ious_all else None,
+        "min": round(float(np.min(ious_all)), 6) if ious_all else None,
+        "verdict": "PASS" if ious_all and min(ious_all) >= 0.85 else "CHECK"}
+    if ious_all:
+        print(f"[C2   ] 掩码位图 IoU（同 bin）：{len(ious_all)} 对，"
+              f"mean {np.mean(ious_all):.4f} / min {np.min(ious_all):.4f}")
+    else:
+        print("[C2   ] 掩码位图 IoU：无配对（帧里没有检出？）")
     return report
 
 
@@ -271,6 +310,59 @@ def _bench_dets_for_first_frames(args, exe, frames, imgsz, n) -> Dict[str, list]
         print(r.stdout[-2000:]); print(r.stderr[-2000:])
         raise RuntimeError(f"bench.exe serial 探针失败 rc={r.returncode}")
     return json.loads(jout.read_text(encoding="utf-8"))["dets"]
+
+
+def _load_mask_dump(dump_dir: Path, fi: int) -> Dict[str, Any]:
+    """读 bench --dump-masks 落盘的第 fi 帧：dets + (n, h, w) bool 掩码。"""
+    meta = json.loads((dump_dir / f"{fi:05d}_maskdets.json").read_text(
+        encoding="utf-8"))
+    raw = (dump_dir / f"{fi:05d}_masks.bin").read_bytes()
+    h, w, m = int(meta["h"]), int(meta["w"]), int(meta["n"])
+    expect = m * h * w
+    if len(raw) != expect:
+        raise ValueError(f"帧 {fi} 掩码 bin 大小 {len(raw)} != {expect}（{m}×{h}×{w}）")
+    offs = meta.get("offsets", [k * h * w for k in range(m)])
+    if len(offs) != m or any(o != k * h * w for k, o in enumerate(offs)):
+        raise ValueError(f"帧 {fi} offsets 与等长拼接口径不符， refusing 猜布局")
+    masks = np.frombuffer(raw, dtype=np.uint8).reshape(m, h, w).astype(bool)
+    return {"h": h, "w": w, "dets": meta["dets"], "masks": masks}
+
+
+def _bench_masks_for_first_frames(args, exe, frames, imgsz, n) -> Dict[str, Any]:
+    """短清单跑一遍 bench --dump-masks，拿 C++ 后处理的 dets + 掩码位图。
+
+    掩码对拍独立于压测循环（bench.cpp 的 mask_dump 探针），同输入下 engine
+    输出确定（500 帧全等已验），这里算出的 dets 与压测轮逐位一致。
+    """
+    dump_dir = Path(args.dump_dir) if args.dump_dir else \
+        (REPO_ROOT / "runs" / "logs" / "cpp_dump")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    list_path = dump_dir / "frames_probe.txt"
+    list_path.write_text("\n".join(frames[:n]) + "\n", encoding="utf-8")
+    jout = dump_dir / "probe_masks.json"
+    cmd = [str(exe), "--engine", args.engine, "--list", str(list_path),
+           "--repeats", "1", "--mode", "serial", "--dump-masks", str(n),
+           "--dump-dir", str(dump_dir),
+           "--json-out", str(jout), "--imgsz", str(imgsz),
+           "--conf-thr", str(args.conf_thr), "--iou-thr", str(args.iou_thr),
+           "--max-det", str(args.max_det), "--mask-thr", str(args.mask_thr)]
+    _add_dll_path_hint(cmd)
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600,
+                       env=_bench_env())
+    if r.returncode != 0:
+        print(r.stdout[-2000:]); print(r.stderr[-2000:])
+        raise RuntimeError(f"bench.exe 掩码探针失败 rc={r.returncode}")
+    return {str(fi): _load_mask_dump(dump_dir, fi) for fi in range(n)}
+
+
+def _cpp_detections(cpp_info: Dict[str, Any]) -> List[Any]:
+    """把 --dump-masks 的帧记录还原成 pipeline.Detection（带掩码）。"""
+    from induvision.pipeline import Detection  # noqa: PLC0415
+    return [Detection(score=d["score"], cls=d["cls"],
+                      box=np.array(d["box"], dtype=np.float64),
+                      box640=np.zeros(4), mask=cpp_info["masks"][k])
+            for k, d in enumerate(cpp_info["dets"])]
 
 
 def _bench_env() -> Dict[str, str]:
@@ -348,6 +440,10 @@ def run_bench(args: argparse.Namespace, exe: Path, frames: List[str],
         return rep
     gp = GpuPreproc(imgsz, "cuda:0")
     runner = TrtRunner(Path(args.engine), device="cuda:0")
+    # 掩码对拍走独立探针（不污染压测计时），拿到 (n, h, w) 位图后用
+    # match_detections(with_mask=True) 出真掩码 IoU —— §2.1 缺口的正式填补。
+    masks_cpp = _bench_masks_for_first_frames(args, exe, frames, imgsz,
+                                              n=min(n, len(frames)))
     rows = []
     for fi in range(min(n, len(frames))):
         img = cv2.imdecode(np.fromfile(str(frames[fi]), dtype=np.uint8),
@@ -362,33 +458,43 @@ def run_bench(args: argparse.Namespace, exe: Path, frames: List[str],
         dets_py = postprocess(outs[0], outs[1], lb, conf_thr=args.conf_thr,
                               iou_thr=args.iou_thr, max_det=args.max_det,
                               mask_thr=args.mask_thr)
-        dets_cpp = [Detection(score=d["score"], cls=d["cls"],
-                              box=np.array(d["box"], dtype=np.float64),
-                              box640=np.zeros(4),
-                              mask=None) for d in rep["dets"].get(str(fi), [])]
-        # mask_pixels 在 Detection 里没有字段，用 box 对拍 + 掩码像素数单独比
-        m = match_detections(dets_py, dets_cpp, iou_thr=0.5, with_mask=False)
+        cpp_info = masks_cpp.get(str(fi))
+        if cpp_info is not None and len(cpp_info["dets"]) == \
+                len(rep["dets"].get(str(fi), [])):
+            dets_cpp = _cpp_detections(cpp_info)  # 带掩码位图
+        else:
+            dets_cpp = [Detection(score=d["score"], cls=d["cls"],
+                                  box=np.array(d["box"], dtype=np.float64),
+                                  box640=np.zeros(4),
+                                  mask=None) for d in rep["dets"].get(str(fi), [])]
+        m = match_detections(dets_py, dets_cpp, iou_thr=0.5, with_mask=True)
         mp_py = sum(int(np.count_nonzero(d.mask)) for d in dets_py)
         mp_cpp = sum(int(d["mask_pixels"]) for d in rep["dets"].get(str(fi), []))
         rows.append({"frame": fi, "n_py": len(dets_py), "n_cpp": len(dets_cpp),
                      "match_rate": m["match_rate"], "mean_box_iou": m["mean_box_iou"],
                      "min_box_iou": m["min_box_iou"],
+                     "mean_mask_iou": m.get("mean_mask_iou"),
                      "mask_pixels_py": mp_py, "mask_pixels_cpp": mp_cpp})
     runner.close()
     ious = [r["mean_box_iou"] for r in rows if r["mean_box_iou"] is not None]
+    mious = [r["mean_mask_iou"] for r in rows if r["mean_mask_iou"] is not None]
     rep["layer_D_vs_python"] = {
         "n_frames": len(rows), "rows": rows,
         "match_rate_min": min(r["match_rate"] for r in rows),
         "mean_box_iou_min": min(ious) if ious else None,
+        "mean_mask_iou_min": min(mious) if mious else None,
         "mask_pixels_equal": sum(r["mask_pixels_py"] == r["mask_pixels_cpp"]
                                  for r in rows),
         "criterion": "§4：match_rate ≥ 0.98、框 IoU ≥ 0.99、掩码 IoU ≥ 0.85"
-                     "（本表先用 mask_pixels 相等数做代理，严格掩码 IoU 待 D 层全量）"}
+                     "（掩码 IoU 为真位图口径：C++ --dump-masks vs Python "
+                     "pipeline 全链路，match_detections 贪心配对后逐对算；"
+                     "mask_pixels 列保留只作参考）"}
     iou_min = rep['layer_D_vs_python']['mean_box_iou_min']
+    miou_min = rep['layer_D_vs_python']['mean_mask_iou_min']
     print(f"[D    ] vs Python 前 {len(rows)} 帧：match_rate min "
           f"{rep['layer_D_vs_python']['match_rate_min']:.4f} / 框 IoU min "
-          f"{iou_min if iou_min is not None else float('nan'):.4f} / 掩码像素相等 "
-          f"{rep['layer_D_vs_python']['mask_pixels_equal']}/{len(rows)}")
+          f"{iou_min if iou_min is not None else float('nan'):.4f} / 掩码 IoU min "
+          f"(逐帧均值) {miou_min if miou_min is not None else float('nan'):.4f}")
     json_out.write_text(json.dumps(rep, ensure_ascii=False, indent=1),
                         encoding="utf-8")
     return rep
