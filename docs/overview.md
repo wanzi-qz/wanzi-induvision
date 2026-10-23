@@ -1,7 +1,8 @@
 # 项目说明：工业缺陷检测与端侧部署闭环
 
 一句话讲完这个项目做了什么：在 MVTec AD 上训练一个能分割 15 类工业缺陷的 YOLOv8-seg 模型，
-再把它从 PyTorch 搬到 ONNX（下一步是 TensorRT），每搬一步都用数字证明「搬完没变味」。
+再把它从 PyTorch 搬到 ONNX、量化成 TensorRT 三档（FP32/FP16/INT8），最后用 C++ 推理服务
+把整条链路跑起来，每搬一步都用数字证明「搬完没变味」。
 
 按 **背景 → 方法 → 结果** 三段读。每段末尾链到细节文档，本文只讲清「做了什么、为什么这么做」。
 
@@ -46,7 +47,7 @@ MVTec AD 是为**无监督异常检测**设计的：官方 `train/` 里只有 `g
 
 ## 2. 方法：具体怎么做的
 
-四个阶段，每阶段都有单测和文档兜着。
+四个阶段，每阶段都有对拍或单测兜着（Python 侧 892 条 pytest 进 CI，C++ 侧靠两个对拍脚本在本机跑）。
 
 ### W1 数据管线
 
@@ -136,18 +137,26 @@ imdecode 占 ~15 ms、letterbox 链只有 ~4 ms；上 GPU 后每帧净省 ~1.8 m
 imdecode，**C++ 版的下一个台阶是 nvJPEG/GPU 解码**，不是更激进的 warpAffine 融合。
 张量级最坏差 max_abs 0.003 / cosine 0.999987；检测级 500 帧检出总数一致。
 
-**② C++ 版：待做，且被本机工具链硬卡住**。TensorRT C++ API（engine 反序列化 → CUDA 流 →
-`cudaWarpAffine` 前处理 → 推理 → 后处理）+ CMake 工程 + 500 帧端到端压测（P50/P95 已在 ① 的 Python 侧
-量出来了，C++ 版要补的是 **P99** 与 `wait`/`busy` 拆分）。本机实测（2026-10-23 06:20，11:35 复核）：`cl` / `link` / `dumpbin` / `nvcc` 仍缺、无 VS 安装目录；
-`cmake` 4.4.4 与 `ninja` 1.13.2 已用 pip 装好，TensorRT 的**头文件已拿到**（v10.16 稀疏克隆，14 个头，
-放仓库外的 `_vendor\`，不入库），**import lib 仍然是 0 个**（pip wheel 里 11 个 DLL）—— MSVC 链接期过不去，
-这一条比装编译器更卡人。另一条复核结论省了 4 GB：实测 TRT 头对 CUDA **只有 1 处 `#include`**
-（`NvInferRuntimeBase.h:24` 的 `cuda_runtime_api.h`），所以不必装整个 CUDA Toolkit，
-conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage，实体包大小未验）就够；
-pip 的 `nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist（0.00 MB）**，此路不通。
-逐样怎么装、`.lib` 从哪来、装完按什么顺序做、拿什么判据验收，写在 [cpp_infer.md](cpp_infer.md)。
-①的实测把 ② 的方向钉住了：含磁盘那轮的瓶颈是 **16~19 ms 的 CPU 前处理**（GPU 已能完全藏进去），
-所以 C++ 版真正要搬上 GPU 的是 letterbox，不是 NMS。
+**② C++ 版：已完成**（`cpp/` 五个编译单元 + 两个头文件 + `tools/check_cpp_infer.py` / `check_cpp_bench.py`，
+2026-10-23 当天装工具链当天交付，报告见 [cpp_bench.md](cpp_bench.md)）。
+链路是：剥掉 engine 前面 844 字节的 ultralytics 头 → `enqueueV3` 单帧闭环 → 一个融合 kernel
+（BGR→RGB + /255 + bilinear + pad 114）**直接把 letterbox 结果写进 engine 的 device 输入**
+→ 三线程流水线（环形队列 + pinned slot 池 + event）→ CPU 后处理（`pipeline.py` 的逐条移植）。
+
+做法上有两个刻意的选择：
+
+1. **对拍切成四层，而不是只比最后结果**。A decode 逐字节、B 前处理张量、C 后处理（同一份 engine 输出
+   喂两边，排除前处理差异）、D 检测级。C 层是这次最值钱的设计：后处理移植的两个真 bug
+   （掩码系数步长写成 1、掩码解码吃了原图坐标而不是 640 域框）只有靠「同一份 bin 两边跑」才定位得到，
+   只做 B+D 的话它们会被前处理的逐位相等掩盖进「查不出来的 0.9 IoU」。
+2. **不为了凑加速比去改流水线**。serial 被 C++ 强化之后（48.4 FPS，比 Python serial 快 19%），
+   同一条流水线能给出的比值必然缩水：实测 **1.23×**，判据是 1.44×，**没达标就写没达标**，
+   原因按 Amdahl 拆开（decode 单飞 ~15 ms，上限 ~66 FPS，实测 59.5），见 cpp_bench.md §3.1。
+
+工具链这一关本身也是实测出来的：MSVC 14.44 + Win11 SDK 26100 走 winget（一次 5008 死锁，靠先升
+Installer 绕开）；CUDA 只装 conda 的 `cuda-cudart-dev` + `cuda-nvcc`（91 MB）而不是 4 GB Toolkit；
+TensorRT 的 `.lib` 由 `dumpbin /exports` + `lib /def:` 从 11 个 DLL 合成（2184 个符号）；
+OpenCV 装在独立前缀 env 里，不动跑着训练的那个 python。逐条坑见 [cpp_infer.md](cpp_infer.md) §2。
 
 ---
 
@@ -242,6 +251,42 @@ GPU util A 组只有 **28~37%**（与 TensorRT 侧 infer util 0.33~0.46 两个�
 而带 `--check-ultralytics` 对拍会把同一轮后面的吞吐数污染 **8.57%** —— 验精度与报吞吐必须分两轮跑。
 详见 [pipeline.md](pipeline.md) §6.5。
 
+### 3.3d W4② C++ 版（fp16 engine，capacity 4，500 帧 = 50 张 × 10 轮）
+
+四层对拍（探针 `--dump-preproc 5 --dump-outs 20`）：
+
+| 层 | 比什么 | 判据 | 实测 |
+| --- | --- | --- | --- |
+| A | decode：C++ `imdecode` vs Python `cv2` | 逐字节一致 | **5/5** |
+| B | 前处理：融合 kernel vs Python `GpuPreproc` | max_abs / cosine | **max_abs 0 / cosine 1.0（逐位相等）** |
+| C | 后处理：同一份 engine 输出喂两边 | score/cls/box/mask_pixels 全 tuple 相等 | **20/20 帧** |
+| D | 检测级：C++ vs Python 全链路 | match_rate ≥0.98、框 IoU ≥0.99 | **1.0000 / min 0.9967**（13 个检出全配上） |
+
+B 层的逐位相等是复刻出来的，不是碰巧：kernel 按 torch `upsample_bilinear2d` 逐项实现
+（源坐标 `(dst+0.5)*in/out-0.5` 负值夹 0、四邻线性组合的浮点顺序、先 /255 再插值），
+所以比路线 C 预研里 cv2-vs-torch 的 max_abs 0.00350 更干净。D 层掩码那条目前用
+**像素数代理**（30 帧 24 帧计数相等，6 帧差 ±1~14 px ≈ 0.04%），严格掩码 IoU 尚未单独计算 ——
+C++ 侧 `Det` 只传计数不传掩码位图，缺口和补法写在 cpp_bench.md §2.1，**没有算就不宣称**。
+
+| 指标 | C++ serial | C++ pipeline | Python 同口径（fp16，A 组） |
+| --- | --- | --- | --- |
+| FPS | 48.42 / 48.23 | **59.47**（另一轮 61.59） | 40.18 / 43.60 → 53.33 / 58.37 |
+| P50 ms | 21.8 / 22.1 | **4.06 / 3.8** | 140 → 109~120 |
+| P95 ms | 28.6 | 6.5 | — |
+| P99 ms | 32.2 | **10.8** | 未报（Python 只到 max） |
+| CPU 核当量 | 1.00 | 1.31 | 1.10 → 1.65 |
+| GPU util | 21.9% | 25.1% | 28~37% |
+
+`(n_det, mask_pixels, score_sum)` 逐帧比较：serial vs pipeline **500/500 全等、n_diff = 0**，
+两轮都一样；两次 serial 之间也 500/500（确定性）。checksum 的 dets = **270**，与 Python 版 500 帧一致。
+
+**加速比 1.23×（另一轮 1.28×）没过 1.44× 判据，这条照实写**：判据 1.44× 是对着 Python 的
+CPU-前处理 serial 基线定的，而 C++ serial 已被强化（48.4 FPS，比 Python 同清单 serial 的
+40.2~43.6 FPS 快 11~21%），流水线收益又被 decode 段卡住（decode 单飞 ~15 ms → 上限 ~66 FPS，
+实测 59.5），比值必然缩水。收益落在 P50 **21.8 → 4.1 ms（5.3×）**、吞吐比 C++ serial +23%
+（比 Python 同口径 +31~36%）、CPU 更省。
+结论是判据该按新基线重校，而不是把流水线改差去凑比值；下一个台阶是 nvJPEG/GPU 解码。
+
 ### 3.4 工程
 
 | 项 | 值 |
@@ -250,6 +295,9 @@ GPU util A 组只有 **28~37%**（与 TensorRT 侧 infer util 0.33~0.46 两个�
 | CI | ubuntu + windows × py3.10/3.12 共 4 job，全绿（`21ce9bb` 起）。CI 比本地少收 `tests/test_focal.py` 一个文件（模块级 `importorskip("torch")`，CI 刻意不装 torch）；W3b 新增的 4 个测试文件与 W4① 新增的 3 个在 CI 里全量跑（本地把 torch 屏蔽掉模拟无 torch 环境实测：pipeline + pinned + prof 328 passed / 1 skipped） |
 | 可复现性 | 同环境同参数重跑：转换 789 文件、合成 870 文件**逐字节全等** |
 | 入库边界 | CI 断言守着：`git ls-files` 出现 `data/`、`weights/`、`out/`、`runs/` 或任何 `.pt/.onnx/.engine/.trt` 就失败 |
+| C++ 交付物 | `cpp/` 五个编译单元 + 两个头文件（engine 头剥离 / 单帧推理 / 融合前处理 kernel / 后处理移植 / 压测主程序）+ `build.bat` + `CMakeLists.txt`；`build/`、`trt_lib/` 与第三方头 `_vendor/` 不入库 |
+| C++ 验证 | 两个 Python 侧对拍器 `check_cpp_infer.py`（A/B/C）与 `check_cpp_bench.py`（D + 压测 + 资源采样）；C++ 侧不进 CI（要 MSVC + TensorRT + 本机 GPU），所以判据靠这两个脚本在本机跑，结果落 Markdown |
+| C++ 工具链 | MSVC 14.44.35207 + Win11 SDK 26100 + conda `cuda-cudart-dev` / `cuda-nvcc` 13.4.92 + OpenCV 5.0（独立前缀 env `C:\Users\11646\cppenv`）+ 由 11 个 DLL 合成的 `nvinfer.lib`（2184 符号）；清单与踩坑见 [cpp_infer.md](cpp_infer.md) §2 |
 
 顺带记一条跨平台坑，因为它把 ubuntu job 连着挂了 7 个提交才被发现：
 `tools/summarize_ablation.py` 的 `dataset_name()` 原先用 `Path()` 直读 `args.yaml` 里的 `data`，
@@ -273,4 +321,7 @@ GPU util A 组只有 **28~37%**（与 TensorRT 侧 infer util 0.33~0.46 两个�
 | Copy-Paste 合成与 focal 消融全过程 | [augmentation.md](augmentation.md) |
 | ONNX 导出、三层校验、固定抽样清单、三档量化 | [deploy.md](deploy.md) |
 | 流水线结构、令牌缓冲池、掩码解码 bug、吞吐实测 | [pipeline.md](pipeline.md) |
+| GPU letterbox 预研：decode 段怎么拆、搬上 GPU 净省多少 | [gpu_preproc.md](gpu_preproc.md) |
+| C++ 版怎么装工具链、拿什么判据验收 | [cpp_infer.md](cpp_infer.md) |
+| C++ 版四层对拍、500 帧延迟与资源、1.23× 的口径分析 | [cpp_bench.md](cpp_bench.md) |
 | 怎么把整条链路跑起来 | [../README.md](../README.md) 的「快速开始」 |

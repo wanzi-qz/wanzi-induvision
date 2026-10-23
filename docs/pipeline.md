@@ -686,16 +686,18 @@ A 组（含磁盘）那边 `q1` 的 underflow 是 300/300 —— **每一帧 inf
 
 ---
 
-## 9. W4② C++ 版还剩什么
+## 9. W4② C++ 版：施工计划与落地状态
 
-先说本机缺什么（2026-10-23 06:20 实测，11:35 复核，不是猜）：`cl` / `link` / `dumpbin` / `nvcc` /
-`gcc` / `g++` 6 个仍然全缺、无 VS 安装目录；`cmake` 4.4.4 + `ninja` 1.13.2 已用 pip 装好，
-TRT v10.16 的 14 个头已拿到。原以为要装 VS Build Tools + CUDA Toolkit 数 GB —— 复核之后
-**CUDA Toolkit 那 4 GB 可以省**：实测 TRT 头对 CUDA 只有 1 处 `#include`（`NvInferRuntimeBase.h:24`），
-conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage）就够；pip 的
-`nvidia-cuda-runtime-cu13` 实测是 **0.0.1 空壳 sdist**，此路不通。剩下的 MSVC 那约 2 GB 省不掉。
-**逐样东西怎么装、TensorRT 的头与 `.lib` 从哪来（pip wheel 里 0 个 `.lib`）、装完按什么顺序做、
-拿什么判据验收，全部写在 [cpp_infer.md](cpp_infer.md)** —— 本节只留方向。
+> **2026-10-23 更新：本节 1~6 条已全部落地，实测报告在 [cpp_bench.md](cpp_bench.md)。**
+> 四层对拍 A/B/C 逐位或逐项相等、D 检测级 match_rate 1.0000 / 框 IoU 0.9967；
+> 500 帧 serial vs pipeline 两轮 **n_diff = 0**；流水线 **59.47 FPS**、P50 **4.1 ms**、P99 **10.8 ms**，
+> 比 Python 同口径 fp16 快 **31~36%**。**加速比 1.23× 未达 §4 的 1.44× 判据**，
+> 原因（C++ serial 基线被强化 + Amdahl 被 imdecode 压住）与口径分析在 cpp_bench.md §3.1，
+> 没有改判据去凑。第 1 条的结论也在这轮被证实：真正下一个台阶是 nvJPEG/GPU 解码。
+>
+> 下面保留施工前的原文，作为「当时为什么这么排优先级」的记录。工具链当时缺什么见
+> [cpp_infer.md](cpp_infer.md) §1 / §2（`cl` / `link` / `dumpbin` / `nvcc` / `gcc` / `g++` 六个全缺，
+> 后来 MSVC 14.44 + Win11 SDK 26100 + conda 的 cudart 头与 nvcc + 合成 `nvinfer.lib` 补齐）。
 
 工具链到位后要做的：
 

@@ -19,8 +19,11 @@ prof.py 的口径采样（nvidia-smi 200ms 一次 + psutil 进程 CPU 核当量�
 
 用法：
   python tools/check_cpp_bench.py --exe cpp/build/bench.exe --mode probe
-  python tools/check_cpp_bench.py --exe cpp/build/bench.exe --mode pipeline \
-      --repeats 10 --json-out runs/logs/cpp_bench.json
+  python tools/check_cpp_bench.py --exe cpp/build/bench.exe --mode bench \
+      --bench-mode pipeline --repeats 10 --json-out runs/logs/cpp_bench.json
+
+（--mode 选 probe=A/B/C 三层对拍 / bench=D 层对拍+压测；
+  --bench-mode 选 bench.exe 自身的 pipeline / serial。）
 
 返回码：0 = 全部判据通过；1 = 有判据不过；2 = 环境/输入错误。
 """

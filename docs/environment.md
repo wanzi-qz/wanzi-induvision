@@ -1,6 +1,7 @@
-# GPU 环境说明（conda env: induvision）
+# 环境说明（conda env: induvision + W4② 的 C++ 工具链）
 
-本文记录项目实际使用的 Python/GPU 环境，所有数字均为本机实测，不是官方标称值。
+本文记录项目实际使用的 Python/GPU 环境与 C++ 编译工具链，所有数字均为本机实测，不是官方标称值。
+C++ 那部分集中在 §7。
 
 ## 1. 环境怎么来的
 
@@ -116,10 +117,12 @@ W:\Anaconda\envs\induvision\python.exe -m pip install -i https://pypi.tuna.tsing
 | --- | --- | --- |
 | TensorRT 10.16.1.11 | **已装**（pip wheel） | FP32/FP16/INT8 三档构建与压测，W3b；实测见 [deploy.md](deploy.md) §8 |
 | trtexec.exe | 未装（wheel 不带） | 不需要；对照数据用 ultralytics 自带导出交叉验证过，见 deploy.md §8.8 |
-| CUDA Toolkit 12.x/13.x（nvcc） | 未装 | 编译 C++/CUDA 扩展，W4 |
-| cuDNN | 已随 torch 自带（92000） | 单独装仅为 C++ 工程链接用，W4 |
-| Visual Studio Build Tools（C++ 工作负载） | 未装 | cl.exe 编译器，W4 |
-| CMake | 未装 | 组织 C++ 工程，W4 |
+| CUDA Toolkit 12.x/13.x（nvcc） | **未装整套**；只用 conda 的 `cuda-cudart-dev` + `cuda-nvcc` 13.4.92 | 编 `preproc.cu`，W4②；为什么不装 4 GB 整套见 §7.1 |
+| cuDNN | 已随 torch 自带（92000） | C++ 工程不直接链它（TRT 自带 kernel），不需要单独装 |
+| Visual Studio Build Tools（C++ 工作负载） | **已装**（MSVC 14.44.35207 + Win11 SDK 26100） | `cl.exe` / `link.exe` / `dumpbin.exe`，W4② |
+| CMake + Ninja | **已装**（pip，cmake 4.4.4 / ninja 1.13.2） | 组织 C++ 工程，W4② |
+| OpenCV（C++） | **已装**（conda-forge 5.0.0，独立前缀 env `C:\Users\11646\cppenv`） | C++ 侧 `imdecode` / `resize`，W4②；为什么不装进 induvision 见 §7.4 |
+| TensorRT import lib（`nvinfer.lib`） | **已合成**（`dumpbin /exports` + `lib /def:`，2184 符号） | MSVC 链接 TRT，W4②；见 §7.3 |
 
 ONNX 三件套（onnx 1.23.2 / onnxruntime 1.31.0 / onnxslim 0.1.98）**已装好并在 W3a 用上**：
 导出与三层精度对齐的实测见 [deploy.md](deploy.md)。
@@ -130,7 +133,79 @@ ONNX 在本项目里的角色是"导出中间格式 + 数值对齐校验"，CPU 
 副作用要记着：`verify_onnx.py` 第 3 层量到的 ORT 延迟是 **CPU 延迟**（providers 里没有
 CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 PyTorch 比后端优劣。
 
-## 7. 已知注意事项
+## 7. C++ 工具链（W4② 补装，2026-10-23）
+
+W4② 之前本机 `cl` / `link` / `dumpbin` / `nvcc` / `gcc` / `g++` 六个命令全缺。这一节记的是
+**实际装成了什么、每样为什么这么装**，逐条踩坑的完整过程在 [cpp_infer.md](cpp_infer.md) §2。
+
+### 7.1 MSVC + Windows SDK（唯一需要管理员的一步）
+
+winget 装 VS Build Tools 时先撞到一个死锁：`winget` 返回 **5008**，原因是它自带的 channel
+钉在 `3.14.2094`、而 feed 已经到 `4.11.24`，两边互不认。绕法是先跑官方最新 Installer
+（`aka.ms/vs/install/latest/vs_Setup.exe`）把 Installer 组件升到 4.11.24，再用它装
+「使用 C++ 的桌面开发」工作负载。`--offline` 那条路不通：离线包要走 OPC 签名校验，
+本机报 `0x800b0003`。
+
+装完实测：**MSVC 14.44.35207** + **Windows SDK 10.0.26100.0**，`cl` / `link` / `dumpbin` 均在
+`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64`。
+
+### 7.2 CUDA：只装头和 nvcc，不装 4 GB Toolkit
+
+依据是实测出来的：TensorRT v10.16 的 14 个头文件里对 CUDA **只有 1 处 `#include`**
+（`NvInferRuntimeBase.h:24` 的 `cuda_runtime_api.h`）。所以不需要整套 Toolkit：
+
+```powershell
+conda install -n induvision -c conda-forge cuda-cudart-dev cuda-nvcc   # 12.6 MB + 91 MB
+```
+
+`cudart.lib` 落在 `W:\Anaconda\envs\induvision\Library\lib\x64`，头在 `Library\include`。
+单装 `cuda-cudart-dev` 时 `nvcc` 编不过：conda 把 `crt/` 目录拍平了，`#include <crt/host_defines.h>`
+变成递归包含（**C1014**）——补 `cuda-nvcc`（带真正的 `crt/` 头）才解决。
+
+反向的死路也记一笔：pip 的 `nvidia-cuda-runtime-cu13` 是 **0.0.1 空壳 sdist（0.00 MB）**，
+里面没有任何头文件，别浪费时间去试。
+
+### 7.3 `nvinfer.lib` 是合成的（pip wheel 里 0 个 `.lib`）
+
+TensorRT 的 pip wheel 只有 11 个 DLL（`nvinfer_10.dll` 358 MB 等），**一个 import lib 都没有**，
+而 MSVC 链接必须要 `.lib`。做法是 `tools/make_trt_lib.py`：对每个 DLL 跑 `dumpbin /exports`
+取导出表，生成 `.def`，再 `lib /def:... /machine:x64 /out:nvinfer.lib`。
+合成结果 **2184 个符号**，`cpp/trt_lib/nvinfer.lib`（不入库）。运行期仍由 PATH 里的
+`tensorrt_libs` 目录提供 DLL。
+
+### 7.4 OpenCV 装在独立前缀 env 里
+
+```powershell
+conda create -p C:\Users\11646\cppenv -c conda-forge libopencv     # 5.0.0
+```
+
+刻意**不装进 induvision**：那个环境的 python 是 anaconda build，从 conda-forge 装 libopencv
+会把它换成 conda-forge build，等于动了正在跑训练和压测的解释器本体。独立前缀只贡献
+`Library\include` 与 `Library\lib`（core500 / imgproc500 / imgcodecs500）给 C++ 链接用。
+
+### 7.5 构建：`cpp\build.bat` 为什么自己设环境
+
+`vcvars64.bat` 内部要调 `reg.exe`，而本机的命令白名单会把它拦掉，所以脚本不调 vcvars，
+直接把 MSVC / SDK 的 `PATH` / `INCLUDE` / `LIB` 写死（路径固定在本机，换机器要改脚本头部的
+几个 `set`）。两条编译期的坑：
+
+- **`nvcc` 默认静态 CRT（/MT）**，与 CMake 的 `/MD` 混链会报一堆 `LNK4217` / `LNK2019`
+  （`__imp_puts`）——加 `-Xcompiler /MD` 对齐；
+- 源码里有中文注释，加 `-Xcompiler /utf-8`；`-arch=native` 只对当前卡有效，换机器要显式给
+  `sm_86` 之类。
+
+```powershell
+cpp\build.bat          # nvcc 编 preproc.obj -> CMake/Ninja 出 infer_one.exe 与 bench.exe
+cpp\build.bat clean    # 清掉 cpp\build
+```
+
+### 7.6 运行期 DLL
+
+`bench.exe` 起来要能找到 `nvinfer_10.dll` / `cudart64_13.dll` / OpenCV 的 DLL。
+`tools/check_cpp_bench.py::_bench_env` 会拼好 PATH（`tensorrt_libs` + `torch/lib` + `cppenv/bin`），
+所以**对拍与压测一律走这个脚本**，别手工双击 exe。
+
+## 8. 已知注意事项
 
 1. **github.com:443 时通时不通**。下载 release 资产走 `https://gh-proxy.com/<原始 github 链接>`，
    本次 22.8 MB 权重 3.6 秒下完。`git push` 也会中招，2026-10-23 00:14 复现过一次硬失败：
@@ -168,7 +243,7 @@ CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 Py
    **2026-10-23 11:35 复测：C 176.90 GB / W 284.90 GB / G 159.80 GB，物理内存 15.22 GB。**
    C 盘比上次记的少了 9.8 GB，**没逐项归因**；能确定的只有仓库里的 `weights\`（三档 engine
    合计 102.38 MB）和 `runs\`（压测 JSON 产物），两者都不入库，量级也不足以解释差额。
-   装 VS Build Tools（约 2 GB）之前先再量一次 C 盘。
+   VS Build Tools 已于 2026-10-23 装好（约 2 GB，占用见 §7.1），装之前量过 C 盘 176.90 GB。
 
 6. **Codex 桌面 App 重启会杀掉它 shell 派生的整棵子进程树**，WMI
    `Win32_Process.Create` 脱离也保不住（2026-10-22 04:12 实测，baseline15 练到
@@ -181,7 +256,7 @@ CUDAExecutionProvider），只能当同机基线，不能拿去和 GPU 上的 Py
    娱乐进程能占掉 2GB 以上；04:28 关掉后显存 3421→1576 MiB，baseline15 单 epoch
    从 105 s 降到 78 s（-26%），而且余量更大、TDR 风险更低。
 
-## 8. 许可与数据合规
+## 9. 许可与数据合规
 
 - 权重 `yolov8s-seg.pt` 与 Ultralytics 代码为 **AGPL-3.0**；MVTec AD 数据集为
   **CC BY-NC-SA 4.0（非商用）**。

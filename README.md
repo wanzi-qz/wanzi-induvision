@@ -23,7 +23,7 @@
 | W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 完成（5 组全出数）→ [docs/baseline.md](docs/baseline.md) §3：Copy-Paste 把 mask mAP50-95 从 0.2453 抬到 **0.4071**（+66%），整张复制的过采样 **0.4003** 与它基本打平（差 0.0068），focal 在这个规模上是**负收益**（C1 0.1953，B2 0.0039 直接学崩）。绝对值不可外引（val 仅 29 图 / 16 实例） |
 | W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟）+ 固定抽样清单 | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass**。口径基准 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`），见 §4.0 |
 | W3b | TensorRT 三档量化 FP32/FP16/INT8（minmax 校准，500 张校准集）+ 三层压测 | 完成 → [docs/deploy.md](docs/deploy.md) §8：INT8 **12.55 MiB**（较 FP32 档 5.2× 压缩）/ 5.77 ms / **173 FPS**（较同场 PyTorch `.pt` **2.41×**），mask mAP50-95 0.3707 → 0.3649（-0.0058，判据 ≤0.03 只用掉 19%），三档 verdict **pass**。踩坑：TensorRT 默认开 TF32，"FP32 档"逐张量 rel_l2 3.3e-3 卡不过判据，`--no-tf32` 才降到 2.5e-7（§8.4） |
-| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | ①完成 → [docs/pipeline.md](docs/pipeline.md)：三档 × {plain,pinned} × {串行,流水线} 全组合实测，A 组含磁盘 **1.44~1.71×**（INT8 51.77 FPS）、B 组 preload **1.19~1.42×**（INT8 **330 FPS**）；与 ultralytics 对拍 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.910~0.916，三档 verdict **pass**。② C++ 版**卡在工具链**：`cl`/`link`/`dumpbin`/`nvcc`/`gcc`/`g++` 6 个命令全缺（2026-10-23 11:35 复核）；但 `cmake` 4.4.4 + `ninja` 1.13.2 已装、TRT v10.16 的 14 个头已拿到、engine I/O 契约与 9 个 API 符号已逐个核对完。实测 TRT 头对 CUDA **只有 1 处 `#include`**（`NvInferRuntimeBase.h:24`），所以**那 4 GB 的 CUDA Toolkit 可以省**，只剩 MSVC（约 2 GB，需管理员）+ cudart 头/lib（conda win-64 13.4.92，22 KB metapackage）+ TRT `.lib`（pip 里 11 个 DLL / **0 个 lib**，合成方案未验）。缺口清单与安装顺序见 [docs/cpp_infer.md](docs/cpp_infer.md) §1 / §2 |
+| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | ①完成 → [docs/pipeline.md](docs/pipeline.md)：三档 × {plain,pinned} × {串行,流水线} 全组合实测，A 组含磁盘 **1.44~1.71×**（INT8 51.77 FPS）、B 组 preload **1.19~1.42×**（INT8 **330 FPS**）；与 ultralytics 对拍 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.910~0.916，三档 verdict **pass**。② 完成 → [docs/cpp_bench.md](docs/cpp_bench.md)：TensorRT C++ API（`enqueueV3` + GPU 融合 letterbox kernel + 三线程流水线 + 自研后处理移植）；四层对拍 A decode 逐字节 5/5、B 前处理 **max_abs 0 / cosine 1.0（逐位相等）**、C 后处理 20/20 帧全 tuple 相等、D 检测级 match_rate **1.0000** / 框 IoU min **0.9967**（掩码那条用像素数代理，严格 IoU 未算，见该文 §2.1）；500 帧 serial vs pipeline **n_diff=0** 两轮全等（dets 270 与 Python 一致）；流水线 **59.47 FPS**（另一轮 61.59，serial 48.42）、**P50 4.1 ms / P95 6.5 / P99 10.8**，比 Python 同口径 fp16 快 **31~36%**。**加速比 1.23× 未达 1.44× 判据**，原因与口径分析见 §3.1（P50 5.3×、CPU 1.65→1.31 核，下一个台阶是 nvJPEG 解码） |
 
 ## 仓库结构
 
@@ -39,6 +39,14 @@ induvision/          核心库（只依赖 numpy / opencv / pyyaml，CI 能全�
   trt_infer.py           TensorRT 运行期：engine 读写（带 ultralytics 风格 metadata header）、device_memory、TrtRunner
   pipeline.py            三阶段流水线：RingBuffer 环形队列 + 解码/推理/后处理三线程 + 自研 NMS 与掩码解码
   pinned.py              pinned memory 令牌池：零拷贝 H2D/D2H，每帧只 stream.synchronize() 一次
+cpp/                  W4② C++ 推理服务（CMake + nvcc；build/ 与 trt_lib/ 不入库）
+  src/engine_header.*   剥掉 .engine 前面 844 字节的 ultralytics 自描述头（JSON + 长度前缀）
+  src/infer_one.cpp     单帧最小闭环：反序列化 → enqueueV3 → 取输出，与 Python 侧逐位相等
+  src/preproc.cu        融合 kernel：BGR→RGB + /255 + bilinear + pad 114，直接写 engine 的 device 输入
+  src/postproc.*        pipeline.py 后处理族的逐条移植（sigmoid / batched NMS / scale_boxes / 掩码解码）
+  src/bench.cpp         serial + 三线程流水线（环形队列 + pinned slot 池 + event），带三个对拍探针
+  build.bat             nvcc 单 TU + 显式 MSVC/SDK 环境（不调 vcvars，原因见 docs/cpp_infer.md §2）
+  CMakeLists.txt        Release / C++17 / /utf-8；TensorRT 路径走 -DTENSORRT_ROOT= 传入，不写死
 tools/
   env_check.py           环境与推理链路自检（可选 --export 验 ONNX 导出）
   download_mvtec.py      取数据：官方 zip 手动模式 / HF 镜像自动模式，逐文件 sha256
@@ -52,6 +60,10 @@ tools/
   build_trt.py           .onnx -> TensorRT engine：三档精度、minmax 校准器、头精度配方、--no-tf32 对照档
   bench_trt.py           三档压测：逐张量对齐 / 端到端 mAP / 单帧延迟 + PyTorch 同场对照，各层带判据与 verdict
   bench_pipeline.py      流水线压测：三档 × {plain,pinned} × {串行,流水线} 全组合，顺带和 ultralytics 参照实现对拍
+  bench_gpu_preproc.py   GPU letterbox 预研：CPU/GPU 前处理交错对比，拆出 imdecode 与 letterbox 各占多少
+  check_cpp_infer.py     C++ 单帧版对拍器：decode 逐字节 / 前处理张量 / 后处理 tuple 三层
+  check_cpp_bench.py     C++ 压测对拍器 + 资源采样（nvidia-smi 200 ms + psutil，照搬 prof.py 口径）
+  make_trt_lib.py        从 tensorrt_libs 的 DLL 导出表合成 nvinfer.lib（wheel 里 0 个 .lib）
   summarize_ablation.py  汇总各组 results.csv 出 Markdown 表，校验「单变量协议」与数据集转换环境指纹
   run_ablation_queue.ps1 消融队列（幂等 + 崩溃自动重试）：跑完的组自动跳过，中断的组搬残档后原地重跑
   run_train_guarded.ps1  单组训练守护：等显存 -> 跑 -> 崩了搬残档重试，最多 -MaxAttempts 次
@@ -66,7 +78,9 @@ docs/                overview.md 项目说明（背景 / 方法 / 结果，先�
                      baseline.md 训练记录 / augmentation.md 合成增强与 focal 消融
                      deploy.md 部署链路（ONNX 导出、三层精度对齐与固定抽样口径）
                      pipeline.md 推理流水线（pinned 令牌池 / 三线程 / 与串行结果对拍 / 500 帧延迟与资源占用）
-                     cpp_infer.md W4② C++ 版施工单（本机工具链缺口实测 / 安装清单 / 验收判据）
+                     gpu_preproc.md GPU letterbox 预研（16~19 ms 的 decode 段怎么拆、搬上 GPU 净省多少）
+                     cpp_infer.md W4② C++ 版施工单（工具链缺口实测 / 安装清单 / 验收判据 / engine I/O 契约）
+                     cpp_bench.md W4② C++ 版实测报告（四层对拍 / 500 帧延迟与资源 / 1.23× 的口径分析）
 requirements-gpu.txt 本地 GPU 环境（钉版本）
 requirements-ci.txt  CI 最小依赖（刻意不含 torch）
 data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"
@@ -138,6 +152,16 @@ python tools/bench_pipeline.py --preload --check-ultralytics --markdown  # B 组
 
 # 端到端延迟 + CPU/GPU 占用（500 帧 = 50 张 × 10 轮；采样默认关，扰动实测小于噪声底）
 python tools/bench_pipeline.py --frames 50 --repeats 10 --sample-resources --markdown
+
+# 7d) C++ 版（W4②）：C++17 + nvcc + TensorRT 10.16 + OpenCV，产物落在 cpp/build/，不入库
+cpp\build.bat                                  # nvcc 编 preproc.obj -> CMake/Ninja 出 bench.exe
+# 构建脚本不调 vcvars64.bat：它内部要跑 reg.exe，而本机的命令白名单会拦掉，
+# 所以脚本自己把 MSVC/SDK 的 PATH/INCLUDE/LIB 写死（路径见 docs/cpp_infer.md §2）
+python tools\check_cpp_infer.py --exe cpp\build\infer_one.exe --engine weights\baseline15_trt_fp16.engine  # A/B/C 三层对拍
+python tools\check_cpp_bench.py --mode bench --bench-mode serial   --frames 500 --repeats 10
+python tools\check_cpp_bench.py --mode bench --bench-mode pipeline --frames 500 --repeats 10
+# 两条命令各跑一遍、各跑两轮；500 帧的 (n_det, mask_pixels, score_sum) 必须两两全等（n_diff=0）
+# 四层对拍判据、1.23× 加速比为什么没到 1.44×，见 docs/cpp_bench.md
 
 # 8) 单测（892 条，约 20 秒；base 环境缺 onnx/ultralytics 会自动跳 6 条）
 python -m pytest -q
@@ -299,8 +323,33 @@ match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.9100~0.9158（判据 0
 [docs/pipeline.md](docs/pipeline.md) §4.2。常驻显存与 pinned 主机内存各 **18.893 MiB**
 （pool_size 2；调到 3/4/6 吞吐几乎不动，见 §7）。
 
-测试规模 563 → **892** 条 pytest（W4① 新增 329 条：pipeline 183 / pinned 59 / prof 87，其中 500 帧端到端延迟与资源采样这轮又补了 102 条）。
-这 329 条一条都不碰 GPU —— 环形队列、令牌池、CUDA 流、`nvidia-smi` 子进程全用假对象测，
+W4② C++ 版实测（2026-10-23，`cpp/build/bench.exe`，fp16 engine，capacity 4，500 帧 = 50 张 × 10 轮；
+工具链是这轮现装的：MSVC 14.44 + Win11 SDK 26100 + conda 的 cudart 头/nvcc + OpenCV 5.0 独立前缀）：
+
+| 层 | 对拍内容 | 判据 | 实测 |
+| --- | --- | --- | --- |
+| A | decode：C++ `imdecode` vs Python `cv2` | 逐字节一致 | **5/5** |
+| B | 前处理：融合 kernel vs Python `GpuPreproc` | max_abs / cosine | **max_abs 0 / cosine 1.0（逐位相等）** |
+| C | 后处理移植：同一份 engine 输出喂两边 | 全 tuple 相等 | **20/20 帧** |
+| D | 检测级：C++ vs Python 全链路 | match_rate ≥0.98 / 框 IoU ≥0.99 | **1.0000 / min 0.9967**（13 检出全配上） |
+
+500 帧：serial **48.42 / 48.23 FPS**（P50 21.8 / 22.1，P95 28.6，**P99 32.2**），
+流水线 **59.47 FPS**（另一轮 61.59；P50 **4.1**，P95 6.5，**P99 10.8**）；
+`(n_det, mask_pixels, score_sum)` 两轮 **500/500 全等，n_diff = 0**，checksum dets **270**
+与 Python 版 500 帧完全一致。CPU 核当量 1.00 → **1.31**，GPU util 21.9% → 25.1%（激活显存 18.29 MiB）。
+
+**加速比 1.23×（另一轮 1.28×），没到判据要求 1.44×** —— 这一条照实写：C++ serial 已经比
+Python 同清单 serial 快（48.4 FPS vs 40.2~43.6 FPS，+11~21%），流水线的上限又被 decode 段压住，
+decode 单飞约 15 ms/帧、理论上限 ~66 FPS，实测 59.5（Amdahl，瓶颈仍在 `imdecode`）。收益落在别处：P50 **21.8 → 4.1 ms（5.3×）**、
+吞吐比 C++ serial +23%（比 Python 同口径 fp16 流水线 +31~36%）、CPU 更省。下一个台阶是 nvJPEG/GPU 解码，不是更激进的三线程。
+掩码那条判据目前用**像素数代理**（30 帧 24 帧计数相等，其余差 ≤14 px / 0.04%），严格掩码 IoU
+**没算**——C++ 侧 `Det` 只传计数不传掩码位图，缺口与补法写在 [docs/cpp_bench.md](docs/cpp_bench.md) §2.1。
+
+移植时被对拍抓到的三个真 bug（都写在 cpp_bench.md §4）：掩码系数沿属性维的步长写成 1
+（帧 0 掩码 102559 → 4682）、掩码解码喂了原图坐标而不是 640 域框（→ 72140）、
+以及 Windows 中文路径三连（MSVC `main` 的 argv 是 GBK，`filesystem::u8path` 一路要用对）。
+
+测试规模 563 → **892** 条 pytest（W4① 新增 329 条：pipeline 183 / pinned 59 / prof 87，其中 500 帧端到端延迟与资源采样这轮又补了 102 条）。这 329 条一条都不碰 GPU —— 环形队列、令牌池、CUDA 流、`nvidia-smi` 子进程全用假对象测，
 连"每帧只 synchronize 一次""出错要把令牌还回池子""采样线程遇 `[N/A]` 不许抛"都是断言出来的。
 延迟那条还钉了一个反直觉的口径：**时间戳必须打在 `put` 之前**，否则背压被藏起来、P95 好看但没意义。
 
