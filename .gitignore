@@ -23,3 +23,6 @@ data/*
 out/
 runs/
 ci-out/
+# W4② C++ 构建产物
+cpp/build/
+cpp/trt_lib/

@@ -52,6 +52,41 @@ dtype / 激活内存）逐个问出来了，计划要用的 TensorRT C++ 符号�
 
 ## 2. 安装清单（按顺序，S1 最轻，S2/S3 是大头）
 
+> **2026-10-23 15:00 实测更新：S2/S3/S5 全部完成，里程碑 1 已验收。**
+> 过程里踩的坑比预想多，全部记在这里，复现时照抄：
+>
+> 1. **S2 的 winget 在线装必死锁（退出码 5008）**：channel 清单把安装器钉在
+>    `3.14.2094`，而 feed 的 `latestinstaller.json` 要求 `4.11.24`，引导器自更新
+>    比对失败（日志特征："Latest installer feed version ... greater than self update
+>    min version ... Bootstrapper failed with known error"）。**解法**：先跑
+>    `https://aka.ms/vs/install/latest/vs_Setup.exe --quiet` 把 VS Installer 本体装到
+>    4.11.24（实测 2m39s），再跑 Build Tools 引导器就跳过自更新直接装
+>    （19 分钟，MSVC 14.44.35207 + Win11 SDK 10.0.26100.0）。
+> 2. **`--update --offline` 路不通**：手动下载的 OPC 在 Authenticode 校验挂
+>    0x800b0003（"Unable to verify the certificate: NotSupported"，证书链验证需要
+>    联网拉 CRL/AIA，本机网络环境下拿不到）。
+> 3. **vcvars64.bat 不能用**：它内部要跑 `reg.exe`，被 WorkBuddy 的命令黑名单拦。
+>    解法见 `cpp\build.bat`——不调 vcvars，直接显式设 `PATH/INCLUDE/LIB`
+>    （MSVC bin + `Windows Kits\10\bin\<ver>\x64` 的 rc/mt + SDK 的 ucrt/um）。
+> 4. **conda cudart 的头是拍平的**：`crt/` 子目录不存在，但所有头都引用
+>    `#include "crt/..."`。**解法**：`conda install cuda-nvcc`（下载 91.1 MB，含
+>    nvcc 本体 + 完整 `crt/` 头），顺带解锁了以后写自定义 kernel 的路。
+>    `cudart.lib` 在 `Library\lib\x64\`（不是 `Library\lib\`）。
+> 5. **S5(b) 合成 `.lib` 实测可行**（全链唯一不确定环节，已消除）：
+>    `dumpbin /exports` + `lib /def:` 从 DLL 合出 `nvinfer.lib`（2184 符号，
+>    2.2 MB）与 `nvinfer_plugin.lib`，工具是 `tools/make_trt_lib.py --vsdev`。
+>    坑：subprocess 列表参数过 list2cmdline 会把整条命令再套引号，cmd 收到
+>    转义引号后把 vcvars 当坏命令——所以脚本里写成临时 .bat 执行；vcvars
+>    banner 是 GBK，`text=True` 默认 utf-8 会崩，必须 `encoding="gbk"`。
+> 6. **.bat 文件里不能有 UTF-8 中文**：cmd 按 GBK 解析，`setlocal` 都会被拆碎。
+>    `cpp\build.bat` 全 ASCII，中文路径用 `%~dp0..` 相对路径表达。
+>
+> **里程碑 1 验收**（`cpp\src\infer_one.cpp` + `engine_header.cpp`，对拍工具
+> `tools/check_cpp_infer.py`）：844 字节头剥离偏移 848 与 Python 一致；三档 engine
+> 的 I/O 契约自检全对；**fp16 上 C++ 与 Python 两个运行时同输入同 engine 输出
+> 逐位相等（max_abs = 0，cosine = 1.0）**；单帧 H2D+enqueueV3+D2H+sync
+> = 3.720 ms（不含前后处理，10 iter 均值）。
+
 ### S1 CMake + Ninja —— **已完成（2026-10-23 06:18 实测）**
 
 走的是最轻的一条：pip 的 `cmake` / `ninja` wheel（零依赖，不动 conda 的包图，不需要管理员），
