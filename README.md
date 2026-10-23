@@ -23,7 +23,7 @@
 | W2 | 缺陷合成 Copy-Paste 增强 + Focal Loss + 小样本/不均衡消融 | 完成（5 组全出数）→ [docs/baseline.md](docs/baseline.md) §3：Copy-Paste 把 mask mAP50-95 从 0.2453 抬到 **0.4071**（+66%），整张复制的过采样 **0.4003** 与它基本打平（差 0.0068），focal 在这个规模上是**负收益**（C1 0.1953，B2 0.0039 直接学崩）。绝对值不可外引（val 仅 29 图 / 16 实例） |
 | W3a | ONNX 导出 + 三层精度对齐（逐张量 / 端到端 mAP / 单帧延迟）+ 固定抽样清单 | 完成 → [docs/deploy.md](docs/deploy.md)：45.53 MB / opset 17 / 动态 batch / checker 通过；逐张量 cosine **1.00000000**、rel_l2 2.4e-7；端到端 mask mAP50-95 0.3740 → **0.3741**；verdict **pass**。口径基准 `configs/bench_sample.json`（64/435，sha256 `eccfd964426a2637`），见 §4.0 |
 | W3b | TensorRT 三档量化 FP32/FP16/INT8（minmax 校准，500 张校准集）+ 三层压测 | 完成 → [docs/deploy.md](docs/deploy.md) §8：INT8 **12.55 MiB**（较 FP32 档 5.2× 压缩）/ 5.77 ms / **173 FPS**（较同场 PyTorch `.pt` **2.41×**），mask mAP50-95 0.3707 → 0.3649（-0.0058，判据 ≤0.03 只用掉 19%），三档 verdict **pass**。踩坑：TensorRT 默认开 TF32，"FP32 档"逐张量 rel_l2 3.3e-3 卡不过判据，`--no-tf32` 才降到 2.5e-7（§8.4） |
-| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | ①完成 → [docs/pipeline.md](docs/pipeline.md)：三档 × {plain,pinned} × {串行,流水线} 全组合实测，A 组含磁盘 **1.44~1.71×**（INT8 51.77 FPS）、B 组 preload **1.19~1.42×**（INT8 **330 FPS**）；与 ultralytics 对拍 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.910~0.916，三档 verdict **pass**。② 完成 → [docs/cpp_bench.md](docs/cpp_bench.md)：TensorRT C++ API（`enqueueV3` + GPU 融合 letterbox kernel + 三线程流水线 + 自研后处理移植）；四层对拍 A decode 逐字节 5/5、B 前处理 **max_abs 0 / cosine 1.0（逐位相等）**、C 后处理 20/20 帧全 tuple 相等、D 检测级 match_rate **1.0000** / 框 IoU min **0.9967** / **掩码位图 IoU 逐帧均值 min 0.9972（判据 0.85，真位图口径）**；500 帧 serial vs pipeline **n_diff=0** 两轮全等（dets 270 与 Python 一致）；流水线 **59.47 FPS**（另一轮 61.59，serial 48.42）、**P50 4.1 ms / P95 6.5 / P99 10.8**，比 Python 同口径 fp16 快 **31~36%**。**加速比 1.23× 未达 1.44× 判据**，原因与口径分析见 §3.1（P50 5.3×、CPU 1.65→1.31 核，下一个台阶是 nvJPEG 解码） |
+| W4 | TensorRT 推理服务：零拷贝 + 三线程流水线 + 压测报告 | ①完成 → [docs/pipeline.md](docs/pipeline.md)：三档 × {plain,pinned} × {串行,流水线} 全组合实测，A 组含磁盘 **1.44~1.71×**（INT8 51.77 FPS）、B 组 preload **1.19~1.42×**（INT8 **330 FPS**）；与 ultralytics 对拍 match_rate **1.0000** / 框 IoU **1.0000** / 掩码 IoU 0.910~0.916，三档 verdict **pass**。② 完成 → [docs/cpp_bench.md](docs/cpp_bench.md)：TensorRT C++ API（`enqueueV3` + GPU 融合 letterbox kernel + 三线程流水线 + 自研后处理移植）；四层对拍 A decode 逐字节 5/5、B 前处理 **max_abs 0 / cosine 1.0（逐位相等）**、C 后处理 20/20 帧全 tuple 相等、D 检测级 match_rate **1.0000** / 框 IoU min **0.9967** / **掩码位图 IoU 逐帧均值 min 0.9972（判据 0.85，真位图口径）**；500 帧 serial vs pipeline **n_diff=0** 两轮全等（dets 270 与 Python 一致）；流水线 **59.47 FPS**（另一轮 61.59，serial 48.42）、**P50 4.1 ms / P95 6.5 / P99 10.8**，比 Python 同口径 fp16 快 **31~36%**。**加速比 1.23× 未达 1.44× 判据**，原因与口径分析见 §3.1（P50 5.3×、CPU 1.65→1.31 核）。③ 完成 → decode 线程池（[docs/cpp_bench.md](docs/cpp_bench.md) §6）：开工预研发现 **MVTec 是 PNG、nvJPEG 解不了**（nvImageCodec 无 Windows 分发），改落 `bench --decode-threads N`——PNG 一字节不动，1/2/3/4/6/8 线程 500 帧 checksum **逐位一致**，**62 → 219 FPS（dt=4）**，正式验收 **230.9 FPS / GPU util 25%→60.6% / CPU 4.26 核**，D 层对拍与 W4② 逐位一致 |
 
 ## 仓库结构
 
@@ -341,7 +341,17 @@ W4② C++ 版实测（2026-10-23，`cpp/build/bench.exe`，fp16 engine，capacit
 **加速比 1.23×（另一轮 1.28×），没到判据要求 1.44×** —— 这一条照实写：C++ serial 已经比
 Python 同清单 serial 快（48.4 FPS vs 40.2~43.6 FPS，+11~21%），流水线的上限又被 decode 段压住，
 decode 单飞约 15 ms/帧、理论上限 ~66 FPS，实测 59.5（Amdahl，瓶颈仍在 `imdecode`）。收益落在别处：P50 **21.8 → 4.1 ms（5.3×）**、
-吞吐比 C++ serial +23%（比 Python 同口径 fp16 流水线 +31~36%）、CPU 更省。下一个台阶是 nvJPEG/GPU 解码，不是更激进的三线程。
+吞吐比 C++ serial +23%（比 Python 同口径 fp16 流水线 +31~36%）、CPU 更省。
+
+**W4③（2026-10-23 晚）：decode 线程池**。开工预研先修正了预研结论——nvJPEG 解不了 PNG
+（MVTec 数据格式），能解 PNG 的 nvImageCodec 没有 Windows 分发；JPEG95 重编码虽快
+（解码 2.74 ms/帧）但是**换数据**（PSNR mean 41.8 dB），不当作免费加速。
+落地的是 `bench --decode-threads N`：decode 段 N 线程按原子下标认领帧，PNG 一字节不动。
+500 帧扫描：**62 → 119（dt=2）→ 219（dt=4）→ 262（dt=6）→ 290 FPS（dt=8，CPU 打满）**，
+六组 checksum（dets 270 / mask_pixels 4803010 / score_sum 168.9960）**逐位一致**；
+正式验收（dt=4 + 资源采样）**230.9 FPS、GPU util 25.1%→60.6%、CPU 4.26 核**，
+D 层对拍同轮复跑与 W4② 逐位一致。e2e 分位数随 N 升高是**排队等待**不是服务变慢
+（口径注记在 cpp_bench.md §6.2）。详细扫描表与"还剩什么"见 [docs/cpp_bench.md](docs/cpp_bench.md) §6。
 掩码那条判据已补齐为**真位图 IoU**（`--dump-masks` 探针，2026-10-23 晚）：30 帧 / 13 个检出，
 逐帧均值 IoU **min 0.9972 / mean 0.9995**，判据 0.85 过线；同 bin 的 C2 层 IoU = 1.0000。
 此前用像素数代理（30 帧 24 帧计数相等，其余差 ≤14 px / 0.04%）的历史记录与补法见

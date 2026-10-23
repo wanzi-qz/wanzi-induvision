@@ -22,9 +22,14 @@ RTX 4060 Laptop 8 GB，fp16 engine，清单 `configs/bench_sample.json` 前 50 �
    e2e P50 **140 → 109~120 ms**。串行比两轮分得开（1.04 / 1.25），
    单轮读数照旧不可信，同轮内比值才是口径。
 3. **下一个台阶不是 letterbox，是 imdecode**。GPU 化之后 decode util 仍是 1.00，
-   段均值从 ~19 ms 降到 ~17.3 ms——瓶颈原封不动地待在 JPEG 解码上。
-   C++ 版想在 1.44× 之上再上台阶，方向是 **nvJPEG / GPU 解码**，而不是更激进的
+   段均值从 ~19 ms 降到 ~17.3 ms——瓶颈原封不动地待在图像解码上。
+   C++ 版想在 1.44× 之上再上台阶，方向是解码段，而不是更激进的
    warpAffine 融合。
+   > **2026-10-23 晚补记（接手 Agent）**：这条当时写的是"nvJPEG / GPU 解码"，
+   > 开工预研发现前提不成立——MVTec 是 PNG，nvJPEG 只解 JPEG，能解 PNG 的
+   > nvImageCodec 没有 Windows 分发。真正落地的是 **decode 线程池**
+   > （`bench --decode-threads N`，PNG 不动、checksum 逐位一致），
+   > 62 → 219 FPS（dt=4），见 cpp_bench.md §6。
 4. **数值对齐没问题**：torch bilinear（float 域，antialias=False）vs
    cv2 INTER_LINEAR（uint8 域），495 帧最坏差
    max_abs **0.00298** / rel_l2 **0.0053** / cosine_min **0.999987**。
@@ -70,7 +75,7 @@ RTX 4060 Laptop 8 GB，fp16 engine，清单 `configs/bench_sample.json` 前 50 �
   8 GB 卡上做正式压测时要记进环境说明。
 - 预热帧（前 5 帧）不参与张量比对；分段计时未剔除预热（均值含首帧污染，
   P50/P95 不受影响，见 JSON）。
-- 本轮没测 nvJPEG / GPU 解码——那是下一个实验，不是本文件的结论。
+- 本轮没测 GPU 解码——那是下一个实验，不是本文件的结论。（后续实测修正：见 cpp_bench.md §6.1，nvJPEG 此路不通，decode 线程池落地。）
 
 ## 5. 实现（`tools/bench_gpu_preproc.py`）
 

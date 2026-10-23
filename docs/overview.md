@@ -134,7 +134,8 @@ NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清
 letterbox 前处理搬上 GPU（torch bilinear + pad，pinned 上传/拷回）实测：那 16~19 ms 的 decode 段里
 imdecode 占 ~15 ms、letterbox 链只有 ~4 ms；上 GPU 后每帧净省 ~1.8 ms，A 组 500 帧端到端流水线
 同轮两轮 **+17.4% / +27.6%**（45.4/45.7 → 53.3/58.4 FPS），decode util 仍 1.00——瓶颈原位留在
-imdecode，**C++ 版的下一个台阶是 nvJPEG/GPU 解码**，不是更激进的 warpAffine 融合。
+imdecode，C++ 版的下一个台阶在解码段（当时猜的是 nvJPEG；实际落地是 decode 线程池，
+nvJPEG 解不了 PNG，见 cpp_bench.md §6.1）。
 张量级最坏差 max_abs 0.003 / cosine 0.999987；检测级 500 帧检出总数一致。
 
 **② C++ 版：已完成**（`cpp/` 五个编译单元 + 两个头文件 + `tools/check_cpp_infer.py` / `check_cpp_bench.py`，
@@ -288,7 +289,8 @@ CPU-前处理 serial 基线定的，而 C++ serial 已被强化（48.4 FPS，比
 40.2~43.6 FPS 快 11~21%），流水线收益又被 decode 段卡住（decode 单飞 ~15 ms → 上限 ~66 FPS，
 实测 59.5），比值必然缩水。收益落在 P50 **21.8 → 4.1 ms（5.3×）**、吞吐比 C++ serial +23%
 （比 Python 同口径 +31~36%）、CPU 更省。
-结论是判据该按新基线重校，而不是把流水线改差去凑比值；下一个台阶是 nvJPEG/GPU 解码。
+结论是判据该按新基线重校，而不是把流水线改差去凑比值；下一个台阶在解码段
+（W4③ 已落地 decode 线程池：62 → 219 FPS，dt=4，checksum 逐位一致，见 cpp_bench.md §6）。
 
 ### 3.4 工程
 

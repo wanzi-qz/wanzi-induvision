@@ -4,7 +4,9 @@
 //   serial    单线程逐帧，阶段内逐段计时；
 //   pipeline  三线程 + 环形队列(capacity) + slot 池(pinned in/out + event)，
 //             语义对齐 Python 版："每帧只 synchronize 一次"（post 段等 event）、
-//             "出错要把令牌还回池子"、"等待计数按调用记不按循环轮数记"。
+//             "出错要把令牌还回池子"、"等待计数按调用记不按循环轮数记"；
+//             --decode-threads N 把 decode 段扩成 N 线程池（W4③：PNG imdecode
+//             ~11 ms/帧是 CPU 串行段，并行认领不改数据不碰像素）。
 //
 // 与 Python 版的分工（docs/cpp_infer.md §4）：
 //   - 资源采样不在这写（口径一漂两张表不可比），C++ 压测跑在 Python 采样器监视下；
@@ -282,6 +284,7 @@ int main(int argc, char** argv) {
   std::string engine_path, list_path, json_out, dump_dir, mode = "pipeline";
   int repeats = 2, capacity = 4, dump_preproc = 0, dump_outs = 0, dump_dets = 0;
   int dump_masks = 0;
+  int decode_threads = 1;
   int imgsz = 640;
   double conf_thr = 0.25, iou_thr = 0.7, mask_thr = 0.5;
   int max_det = 300;
@@ -308,6 +311,7 @@ int main(int argc, char** argv) {
     else if (a == "--dump-outs") { dump_outs = std::stoi(next("--dump-outs")); }
     else if (a == "--dump-dets") { dump_dets = std::stoi(next("--dump-dets")); }
     else if (a == "--dump-masks") { dump_masks = std::stoi(next("--dump-masks")); }
+    else if (a == "--decode-threads") { decode_threads = std::stoi(next("--decode-threads")); }
     else if (a == "--dump-dir") dump_dir = next("--dump-dir");
     else if (a == "--json-out") json_out = next("--json-out");
     else if (a == "--mode") mode = next("--mode");
@@ -315,6 +319,7 @@ int main(int argc, char** argv) {
   }
   if (engine_path.empty() || list_path.empty()) die("缺 --engine / --list");
   if (capacity < 2) die("capacity 至少 2（slot 池太小流水线没意义）");
+  if (decode_threads < 1 || decode_threads > 16) die("--decode-threads 取值 1~16");
 
   // ---- 读帧清单（Python 侧生成，保证与 W4① 同一 canonical 顺序）
   std::vector<std::string> files;
@@ -597,29 +602,47 @@ int main(int argc, char** argv) {
   std::atomic<int> decoded{0}, inferred{0};
   auto run_pipeline = [&] {
     decoded = inferred = 0;
-    // -- decode 线程：读图 + imdecode + meta + 拷 pinned 暂存
-    std::thread t_dec([&] {
-      for (int fi = 0; fi < n_frames; ++fi) {
-        const auto tw0 = std::chrono::steady_clock::now();
-        const std::string& path = *frames[fi].path;
-        const auto raw = read_file(path);
-        cv::Mat img = cv::imdecode(cv::Mat(1, static_cast<int>(raw.size()), CV_8U,
-                                           const_cast<uint8_t*>(raw.data())),
-                                   cv::IMREAD_COLOR);
-        if (img.empty()) die("imdecode 失败：" + path);
-        const auto lb = letterbox_meta(img.cols, img.rows, imgsz);
-        const int slot = pool.acquire();
-        Slot& s = pool.at(slot);
-        s.img_bytes = static_cast<size_t>(img.rows) * img.cols * 3;
-        s.img_w = img.cols; s.img_h = img.rows;
-        std::memcpy(s.pin_in, img.data, s.img_bytes);
-        const auto tw1 = std::chrono::steady_clock::now();
-        busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count();
-        PostTask t{slot, frames[fi].idx, path, since(t_prog), lb,
-                   0.0};
-        decoded++;
-        if (!q1.put(std::move(t))) { pool.release(slot); return; }
-      }
+    // -- decode 线程池：N 个线程按原子下标认领帧（乱序解码，见下）。
+    //    PNG imdecode ~11 ms/帧是 CPU 串行段，多线程并行认领是纯并发手段：
+    //    数据一字节不动（解出的像素与单线程逐位一致），结果由主线程按 idx
+    //    收集（results[r.idx]），乱序不破坏一致性。decode_threads=1 时就是
+    //    原来的单线程顺序语义。e2e 口径随之变化：t_start_ms 仍记"该帧 decode
+    //    开始"，先解完的帧会在 q1 里等更久 —— e2e 分位数可能升高，吞吐才是
+    //    这里的目标指标（docs/cpp_bench.md §6 有对照表）。
+    const int dec_n = decode_threads;
+    std::atomic<int> dec_next{0};
+    std::vector<std::thread> t_decs;
+    t_decs.reserve(static_cast<size_t>(dec_n));
+    for (int tid = 0; tid < dec_n; ++tid) {
+      t_decs.emplace_back([&] {
+        for (;;) {
+          const int fi = dec_next.fetch_add(1);
+          if (fi >= n_frames) break;
+          const auto tw0 = std::chrono::steady_clock::now();
+          const std::string& path = *frames[fi].path;
+          const auto raw = read_file(path);
+          cv::Mat img = cv::imdecode(cv::Mat(1, static_cast<int>(raw.size()), CV_8U,
+                                             const_cast<uint8_t*>(raw.data())),
+                                     cv::IMREAD_COLOR);
+          if (img.empty()) die("imdecode 失败：" + path);
+          const auto lb = letterbox_meta(img.cols, img.rows, imgsz);
+          const int slot = pool.acquire();
+          Slot& s = pool.at(slot);
+          s.img_bytes = static_cast<size_t>(img.rows) * img.cols * 3;
+          s.img_w = img.cols; s.img_h = img.rows;
+          std::memcpy(s.pin_in, img.data, s.img_bytes);
+          const auto tw1 = std::chrono::steady_clock::now();
+          busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count();
+          PostTask t{slot, frames[fi].idx, path, since(t_prog), lb,
+                     0.0};
+          decoded++;
+          if (!q1.put(std::move(t))) { pool.release(slot); return; }
+        }
+      });
+    }
+    // 全部 decode 线程退出后才关 q1（单线程版是循环结束顺手 close）
+    std::thread t_dec_close([&] {
+      for (auto& th : t_decs) th.join();
       q1.close();
     });
     // -- infer 线程：H2D → kernel → enqueueV3 → D2H → 记 event（全程异步发射）
@@ -678,7 +701,7 @@ int main(int argc, char** argv) {
       ++got;
       if (got == n_frames) break;
     }
-    t_dec.join(); t_inf.join(); t_post.join();
+    t_dec_close.join(); t_inf.join(); t_post.join();
   };
 
   // ---- dump 探针（压测前做一次，不污染计时）
@@ -726,6 +749,7 @@ int main(int argc, char** argv) {
   j.kv_str("engine", engine_path);
   j.kv("repeats", repeats);
   j.kv("capacity", capacity);
+  j.kv("decode_threads", decode_threads);
   j.kv("frames", n_frames);
   j.s += ",\"wall_s\":" + std::to_string(wall_s);
   j.s += ",\"fps\":" + std::to_string(n_frames / wall_s);

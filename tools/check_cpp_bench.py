@@ -403,6 +403,7 @@ def run_bench(args: argparse.Namespace, exe: Path, frames: List[str],
     cmd = [str(exe), "--engine", args.engine, "--list", str(list_path),
            "--repeats", str(args.repeats), "--capacity", str(args.capacity),
            "--mode", args.bench_mode, "--imgsz", str(imgsz),
+           "--decode-threads", str(args.decode_threads),
            "--conf-thr", str(args.conf_thr), "--iou-thr", str(args.iou_thr),
            "--max-det", str(args.max_det), "--mask-thr", str(args.mask_thr),
            "--dump-dets", str(args.dump_dets), "--json-out", str(json_out)]
@@ -518,6 +519,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--repeats", type=int, default=10)
     ap.add_argument("--capacity", type=int, default=4)
+    ap.add_argument("--decode-threads", type=int, default=1,
+                    help="bench.exe 流水线的 decode 线程数（W4③，1=原单线程语义）")
     ap.add_argument("--bench-mode", default="pipeline",
                     choices=["pipeline", "serial"])
     ap.add_argument("--conf-thr", type=float, default=0.25)
