@@ -182,8 +182,13 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 
 ## 3. 装完做什么（按性价比排序，对齐 [pipeline.md](pipeline.md) §9）
 
-1. **前处理搬上 GPU**：`cudaWarpAffine` 一次做完 letterbox 的缩放 + pad，替掉 A 组那 **16~19 ms**
-   的 CPU 读图 + resize。A 组的瓶颈就是它（decode util 1.00），所以这是 1.44~1.67× 之上的下一个台阶。
+1. **前处理搬上 GPU**：`cudaWarpAffine` 一次做完 letterbox 的缩放 + pad。**但先看
+   [gpu_preproc.md](gpu_preproc.md) 的实测分解**：那 16~19 ms 里 imdecode 占 ~15 ms、
+   letterbox 链只有 ~4 ms——GPU 化 letterbox 净省 ~1.8 ms/帧，端到端流水线
+   +17~28%（同轮两轮 45.4/45.7 → 53.3/58.4 FPS）。decode util 仍 1.00，瓶颈原位
+   留在 imdecode 上。所以 C++ 版的真正台阶是 **nvJPEG/GPU 解码**；warpAffine 是
+   顺手做掉的第一步，且 Python 版每帧多一笔 4.688 MiB D2H 拷回、C++ 版没有——
+   实测收益是 C++ 版的保守下界。
 2. **多 CUDA stream + event**：W4① 只有一条流，H2D / kernel / D2H 在流内串行，重叠只发生在
    "GPU 忙"与"CPU 忙"之间。多流才能让第 n 帧的 D2H 和第 n+1 帧的 H2D 真的并行。
 3. **度量口径修正**：`acquire` 等待单独计时（`decode_wait_ms` vs `decode_busy_ms`），

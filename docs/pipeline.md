@@ -699,9 +699,13 @@ conda 的 `cuda-cudart-dev`（win-64 13.4.92，22 KB metapackage）就够；pip 
 
 工具链到位后要做的：
 
-1. **前处理搬上 GPU**：`cudaWarpAffine` 做 letterbox（缩放 + pad 一次搞定），
-   替掉 A 组那 16~19 ms 的 CPU 读图 + resize。这是 A 组 1.7× 之上的下一个台阶，
-   因为 A 组的瓶颈就是它。
+1. **前处理搬上 GPU**：`cudaWarpAffine` 做 letterbox（缩放 + pad 一次搞定）。
+   **2026-10-23 已在 Python 侧预研实测（[gpu_preproc.md](gpu_preproc.md)，路线 C）**：
+   那 16~19 ms 里 imdecode 占 ~15 ms、letterbox 链只有 ~4 ms；letterbox 上 GPU 后
+   每帧净省 ~1.8 ms，端到端流水线 +17~28%（同轮两轮），decode util 仍 1.00，
+   瓶颈原位留在 imdecode —— **C++ 版真正的下一个台阶是 nvJPEG/GPU 解码**，
+   warpAffine 是顺手做掉的第一步。Python 版每帧多一笔 4.688 MiB D2H 拷回、C++ 版没有，
+   预研测出的收益是 C++ 版的保守下界。
 2. **多 CUDA stream**：本轮只有一条流，H2D/kernel/D2H 在流内是串行的，
    重叠只发生在「GPU 忙」与「CPU 忙」之间。多流 + event 才能让第 n 帧的 D2H 和第 n+1 帧的 H2D 真的并行。
 3. **绕开 GIL**：C++ 天然没有。但注意本轮的证据（§7）**并不支持**「Python 版是被 GIL 卡住的」这个说法 ——

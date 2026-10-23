@@ -129,6 +129,13 @@ NMS 与掩码解码全部自己写（脱离 ultralytics），同一份 30 张清
 与 ultralytics 对拍 match_rate 1.0000 / 框 IoU 1.0000 / 掩码 IoU 0.910~0.916，三档 10 条判据全过。
 细节、掩码解码那个 bug 的完整排查、以及「util ≈0.99 不等于算力打满」这个读数陷阱见 [pipeline.md](pipeline.md)。
 
+**路线 C 预研：已完成**（2026-10-23，`tools/bench_gpu_preproc.py` + [gpu_preproc.md](gpu_preproc.md)）。
+letterbox 前处理搬上 GPU（torch bilinear + pad，pinned 上传/拷回）实测：那 16~19 ms 的 decode 段里
+imdecode 占 ~15 ms、letterbox 链只有 ~4 ms；上 GPU 后每帧净省 ~1.8 ms，A 组 500 帧端到端流水线
+同轮两轮 **+17.4% / +27.6%**（45.4/45.7 → 53.3/58.4 FPS），decode util 仍 1.00——瓶颈原位留在
+imdecode，**C++ 版的下一个台阶是 nvJPEG/GPU 解码**，不是更激进的 warpAffine 融合。
+张量级最坏差 max_abs 0.003 / cosine 0.999987；检测级 500 帧检出总数一致。
+
 **② C++ 版：待做，且被本机工具链硬卡住**。TensorRT C++ API（engine 反序列化 → CUDA 流 →
 `cudaWarpAffine` 前处理 → 推理 → 后处理）+ CMake 工程 + 500 帧端到端压测（P50/P95 已在 ① 的 Python 侧
 量出来了，C++ 版要补的是 **P99** 与 `wait`/`busy` 拆分）。本机实测（2026-10-23 06:20，11:35 复核）：`cl` / `link` / `dumpbin` / `nvcc` 仍缺、无 VS 安装目录；
