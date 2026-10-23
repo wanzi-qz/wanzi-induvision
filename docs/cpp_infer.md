@@ -217,6 +217,13 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 
 ## 3. 装完做什么（按性价比排序，对齐 [pipeline.md](pipeline.md) §9）
 
+> **2026-10-23 实测更新：第 1~4 条已全部做完，结果与判据逐条落在
+> [cpp_bench.md](cpp_bench.md)**——四层对拍全过（前处理张量逐位相等、后处理
+> 移植 20/20 帧全 tuple 相等）、500 帧全等 n_diff=0、流水线 59.5/61.6 FPS
+> （比 Python 同口径 +31~35%，P50 5.3×）；加速比 1.23× 未达下面第 4 条对应的
+> 1.44× 判据，口径分析在 cpp_bench.md §3.1。第 5 条（nvJPEG/GPU 解码）是
+> 实测出的下一个台阶。
+
 1. **前处理搬上 GPU**：`cudaWarpAffine` 一次做完 letterbox 的缩放 + pad。**但先看
    [gpu_preproc.md](gpu_preproc.md) 的实测分解**：那 16~19 ms 里 imdecode 占 ~15 ms、
    letterbox 链只有 ~4 ms——GPU 化 letterbox 净省 ~1.8 ms/帧，端到端流水线
@@ -240,6 +247,11 @@ lib /def:nvinfer_plugin.def /machine:x64 /out:nvinfer_plugin.lib
 ---
 
 ## 4. 验收判据（基线数字全部来自 pipeline.md §6.5，同清单同口径，一条都不松）
+
+> **2026-10-23 实测**：match_rate 1.0000 / 框 IoU min 0.9967 / 500 帧全等
+> n_diff=0 / P50·P95·P99 已补 —— 全过；唯一未达标的是加速比 1.23× < 1.44×
+> （口径分析：cpp_bench.md §3.1，serial 基线被 C++ 强化后 Amdahl 上限压住了
+> 比值，收益实际落在 P50 5.3× 与吞吐 +23%）。完整数字见 [cpp_bench.md](cpp_bench.md)。
 
 | 判据 | 阈值 | 基线出处 |
 | --- | --- | --- |
