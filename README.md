@@ -1,17 +1,51 @@
 # wanzi-induvision
 
-工业缺陷检测与端侧部署闭环。在 MVTec AD 上训练 YOLOv8-seg 做缺陷分割，
-再走 ONNX → TensorRT 三档量化（FP32/FP16/INT8），最后用 TensorRT C++ API
-写推理服务、做端到端压测，产出一份精度-速度-显存对照报告。
+## 介绍
 
-个人求职项目。硬件是 RTX 4060 Laptop 8GB / Windows 11，所以所有工程决策都围绕
-"8GB 显存怎么把链路跑完整"来做。文档里的数字全部是本机实测，
-还没跑到的阶段一律标 **待测**，不预填、不估。
+工业质检的漏检，多数不是"看不见"，而是**目标太小、样本太少**：本项目使用的 MVTec AD 里，缺陷
+面积中位数只占整图 **1.54%**，两类的冒烟子集里缺陷图也仅占 **23.6%**——小目标 + 正样本稀缺，
+直接决定了后面的方法选择（缺陷合成增强、按 test split 重算成绩）。落地还有第二个约束：模型要
+跑进产线节拍，而 PyTorch 的推理链在算力有限的设备上留不出余量，于是有了量化与 C++ 推理服务。
+
+本项目以 **MVTec AD 15 类工业缺陷（5354 张图）**为对象，跑通一条"训练 → 量化 → 端侧推理服务"的
+完整闭环：把官方掩码转成 YOLO-seg 多边形标签并做分层划分；用 Copy-Paste 把 train 划分里的真实缺陷
+实例贴到正常图上扩样，缓解小样本与类别不均衡；训练 YOLOv8-seg 并做消融（合成增强 / Focal Loss /
+去负样本）；随后导出 ONNX、构建 TensorRT **FP32 / FP16 / INT8** 三档 engine；最后分别用 TensorRT
+**Python API 与 C++ API** 写两套推理服务（三线程流水线 + pinned memory 零拷贝、GPU 融合 letterbox
+kernel、decode 线程池），并在同一台机器上做精度-延迟-显存对照与**逐帧对拍**。
+
+结果：Copy-Paste 把 mask mAP50-95 从 **0.245 抬到 0.407（+66%）**（2 类消融子集，看相对提升）；
+INT8 engine **12.55 MiB / 173 FPS**（较同场 PyTorch **2.41×**）；C++ 版单帧 **P50 4.1 ms**、
+吞吐 **230.89 FPS**，与 Python 版逐帧对拍结果完全一致（match_rate **1.0000**、掩码 IoU **0.997**）。
+
+## 项目贡献
+
+- **一条可复现的完整链路**：数据下载校验 → 标签转换 → 合成增强 → 训练/消融 → ONNX/TRT 量化 →
+  Python 与 C++ 两套推理服务 → 压测报告。每步都有命令行、单测（**892 条**）和 CI。
+- **合成增强的收益与边界都量化**：小样本场景 mask mAP50-95 +66%；同时如实记录 focal 在这个规模
+  是**负收益**、去负样本组因训练步数不可比而**结论挂起**——不把无效方法写成有效。
+- **跨实现一致性有证据**：四层对拍（解码逐字节 / 前处理逐位 / 后处理逐项 / 检测级 IoU）+ 500 帧
+  checksum 逐位全等，量化与用 C++ 重写都不"变味"；哪条判据没验也明写（不宣称）。
+- **端侧性能靠工程而非调参**：GPU 融合前处理 kernel、pinned 零拷贝、decode 线程池，吞吐
+  **62 → 230.89 FPS**、单帧 P50 **21.8 → 4.1 ms**，一致性一分不让。
+
+## 数据集
+
+[MVTec AD](https://www.mvtec.com/company/research/datasets/mvtec-ad)（Bergmann et al., CVPR 2019）：
+15 类工业物体/纹理，5354 张图 + 像素级掩码标注；官方 `train/good` 3629 张整体作为**背景负样本**
+进 train。许可 **CC BY-NC-SA 4.0（非商用）**，数据不入库——脚本从 `hf-mirror` 逐文件下载并用
+sha256 对比 HF LFS 的 `lfs.oid` 校验。
+
+## 实验环境
+
+RTX 4060 Laptop **8GB** / Windows 11 / conda env（构建过程见 [docs/environment.md](docs/environment.md)）。
+所有工程决策围绕"8GB 显存怎么把链路跑完整"来做。文档里的数字**全部本机实测**，没跑到的标
+**待测**，不预填、不估；同一台机器不同轮次的延迟不可直接相减（时钟与温度会漂），跨组比较只在同轮内成立。
 
 [![CI](https://github.com/wanzi-qz/wanzi-induvision/actions/workflows/ci.yml/badge.svg)](https://github.com/wanzi-qz/wanzi-induvision/actions/workflows/ci.yml)
 
-第一次看这个仓库，先读 [docs/overview.md](docs/overview.md)：按 **背景 → 方法 → 结果**
-把整条链路一次讲完。下面这张进度表是它的索引版，每行链到对应的细节文档。
+想按顺序看论证过程，读 [docs/overview.md](docs/overview.md)：按 **背景 → 方法 → 结果** 一次讲完。
+下面这张进度表是它的索引版，每行链到对应的细节文档。
 
 ## 进度
 
@@ -96,84 +130,69 @@ data/ weights/ out/ runs/   全部不入库，见下方"许可与入库边界"
 # 0) 环境（conda env: induvision，构建过程见 docs/environment.md）
 conda activate induvision
 
-# 1) 取数据。官方站要勾 EULA 不能直连，HF 镜像可脚本化，逐文件校验 sha256
+# 1) 取数据：走 hf-mirror、逐文件 sha256 校验（口径见 docs/dataset.md）
 python tools/download_mvtec.py --source hf --categories bottle toothbrush
 
-# 2) 转成 YOLO-seg（默认硬链接落盘，同盘不额外占空间）
+# 2) 转成 YOLO-seg（硬链接落盘，同盘不额外占空间）
 python tools/convert_mvtec_to_yolo.py --src data/mvtec_raw --out out/yolo_mvtec
 
-# 3) 训练。统一走 train_seg.py：配置留档、可选 focal 注入、跑完打指标摘要
+# 3) 训练（8GB 显存默认 imgsz 640 / batch 8 / AMP on）
 python tools/train_seg.py --data out/yolo_mvtec/data.yaml `
      --model weights/yolov8s-seg.pt --name baseline --epochs 100
-# 8GB 显存起步参数就是默认的 imgsz 640 / batch 8 / AMP on（实测 2.3~3.0 GiB）
-# 产物落在 runs/segment/baseline。别传 --project runs，会拼成 runs/segment/runs/baseline
 
-# 3b) 小样本 + 类别不均衡：先合成缺陷补齐少数类，再训练
+# 3b) 小样本 + 类别不均衡：先合成缺陷再训练；合成只加 train，val/test 逐字节不动
 python tools/synthesize_defects.py --src out/yolo_mvtec --out out/yolo_mvtec_cp `
      --cap-factor 2.0 --seed 0 --workers 4
 python tools/train_seg.py --data out/yolo_mvtec_cp/data.yaml `
      --model weights/yolov8s-seg.pt --name cp_focal `
      --focal-gamma 2.0 --focal-alpha 0.25 --epochs 100
-# 合成只加 train，val/test 逐字节不动；细节和防泄漏口径见 docs/augmentation.md
 
-# 4) 消融：四组各 100 epoch 要一小时以上，用幂等队列放后台跑
-#    跑完的组自动跳过，被系统重启打断后重跑同一条命令就从断点续
+# 4) 消融：四组各 100 epoch，幂等队列后台跑（跑完的组自动跳过）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/run_ablation_queue.ps1
 
-# 5) 汇总成表，顺带校验各组超参与数据集转换环境真的一致
-python tools/summarize_ablation.py --markdown          # 可直接贴进 docs/baseline.md
-python tools/summarize_ablation.py --strict            # 协议或环境指纹不一致就返回非零
+# 5) 汇总成表，并校验各组超参与环境指纹一致
+python tools/summarize_ablation.py --markdown
+python tools/summarize_ablation.py --strict            # 不一致就返回非零
 
-# 6) 报成绩要在 test split 上重算：best.pt 是靠 val 早停选出来的，
-#    拿 val 的数当最终成绩等于在选过的数据上报告结果
+# 6) 成绩必须在 test split 上重算：best.pt 是按 val 早停选出来的
 python tools/eval_seg.py --weights runs/segment/baseline/weights/best.pt `
      --data out/yolo_mvtec/data.yaml --split test --name baseline --markdown
 
-# 7) 部署链路：导出 ONNX，再验一遍「换后端没换语义」（逐张量 / 端到端 mAP / 延迟）
+# 7) 导出 ONNX，再验一遍「换后端没换语义」（逐张量 / 端到端 mAP / 延迟）
 python tools/export_onnx.py --weights runs/segment/baseline15/weights/best.pt --markdown
-# 7a) 抽样口径基准只做一次，产物入库（仓库里已有一份，别重复生成，否则和历史报告不可比）
 python tools/verify_onnx.py --sample-n 64 --sample-list-out configs/bench_sample.json --dry-run
 python tools/verify_onnx.py --weights runs/segment/baseline15/weights/best.pt `
      --align-n 16 --bench-n 30 --val --val-batch 8 --markdown
-# 三层全跑 81.5 s（端到端那层在 CPU 上最慢）。只看配置不写盘加 --dry-run
-# 清单在就用清单，对不上就降级并在 stdout / JSON / Markdown 三处留痕；不接受降级加 --strict-sample
-# 前处理复刻口径、三条判据、固定抽样清单与踩坑记录见 docs/deploy.md
+# 抽样清单入库后别重新生成，否则和历史报告不可比；判据与踩坑见 docs/deploy.md
 
-# 7b) TensorRT 三档量化与压测（要 GPU + tensorrt，本机在 conda env: induvision 里）
+# 7b) TensorRT 三档量化与压测（要 GPU + tensorrt）
 python tools/make_calib_list.py --data out/yolo_mvtec15/data.yaml --split train --n 500
-python tools/build_trt.py --prec fp32 fp16 int8      # 三档连建 456.9 s
-python tools/bench_trt.py --val --markdown           # 三层压测 78.9 s，出 verdict
-# 本机没有 trtexec.exe（pip wheel 只带运行期 .dll），三档全走 TensorRT Python API
-# 想看关掉 TF32 的真 FP32 对照档：build_trt.py --name x --prec fp32 --no-tf32
-# 三档实测数字、TF32 排查、INT8 连挂四次的根因见 docs/deploy.md §8
+python tools/build_trt.py --prec fp32 fp16 int8
+python tools/bench_trt.py --val --markdown
+# 本机没有 trtexec，三档全走 Python API；TF32 与 INT8 连挂的根因见 docs/deploy.md §8
 
-# 7c) 推理流水线压测（同样要 GPU + tensorrt）：三档 × {plain,pinned} × {串行,流水线} 全组合
-python tools/bench_pipeline.py --check-ultralytics --markdown            # A 组含磁盘，92.2 s
-python tools/bench_pipeline.py --preload --check-ultralytics --markdown  # B 组 preload，27.0 s
-# 对外报数用 A 组（含读盘的真实口径）：INT8 51.77 FPS，较同档串行 1.563x
-# B 组是把图先读进内存、只量推理链路的上限：INT8 330.05 FPS（1.413x）
-# 两组数字别混着读，为什么见 docs/pipeline.md §5
+# 7c) 推理流水线：三档 × {plain,pinned} × {串行,流水线}
+python tools/bench_pipeline.py --check-ultralytics --markdown              # A 组含磁盘
+python tools/bench_pipeline.py --preload --check-ultralytics --markdown    # B 组 preload
+# 对外报数用 A 组；A/B 两组别混读，为什么见 docs/pipeline.md §5
 
-# 端到端延迟 + CPU/GPU 占用（500 帧 = 50 张 × 10 轮；采样默认关，扰动实测小于噪声底）
+# 端到端延迟 + CPU/GPU 占用（500 帧 = 50 张 × 10 轮）
 python tools/bench_pipeline.py --frames 50 --repeats 10 --sample-resources --markdown
 
-# 7d) C++ 版（W4②）：C++17 + nvcc + TensorRT 10.16 + OpenCV，产物落在 cpp/build/，不入库
-cpp\build.bat                                  # nvcc 编 preproc.obj -> CMake/Ninja 出 bench.exe
-# 构建脚本不调 vcvars64.bat：它内部要跑 reg.exe，而本机的命令白名单会拦掉，
-# 所以脚本自己把 MSVC/SDK 的 PATH/INCLUDE/LIB 写死（路径见 docs/cpp_infer.md §2）
-python tools\check_cpp_infer.py --exe cpp\build\infer_one.exe --engine weights\baseline15_trt_fp16.engine  # A/B/C 三层对拍
+# 7d) C++ 版：C++17 + nvcc + TensorRT 10.16 + OpenCV，产物落 cpp/build/，不入库
+cpp\build.bat
+python tools\check_cpp_infer.py --exe cpp\build\infer_one.exe --engine weights\baseline15_trt_fp16.engine
 python tools\check_cpp_bench.py --mode bench --bench-mode serial   --frames 500 --repeats 10
 python tools\check_cpp_bench.py --mode bench --bench-mode pipeline --frames 500 --repeats 10
-# 两条命令各跑一遍、各跑两轮；500 帧的 (n_det, mask_pixels, score_sum) 必须两两全等（n_diff=0）
-# 四层对拍判据、1.23× 加速比为什么没到 1.44×，见 docs/cpp_bench.md
+# 构建脚本自己设 MSVC/SDK 环境（不调 vcvars64），原因见 docs/cpp_infer.md §2；
+# 对拍判据与 1.23× 为什么没到 1.44×，见 docs/cpp_bench.md
 
 # 8) 单测（892 条，约 20 秒；base 环境缺 onnx/ultralytics 会自动跳 6 条）
 python -m pytest -q
 ```
 
-长训练一律走守护脚本，别裸跑 —— 这台机器驱动会 TDR（见 docs/baseline.md §3
-「队列与中断恢复」：一晚两次，一次蓝屏 `0x00000116`，一次 `CUDA error: unknown error`）。
-守护脚本认 `train_args.json` 判断"这组到底跑完没有"，崩了就搬残档、探一次 `nvidia-smi`、原地重跑：
+长训练一律走守护脚本，别裸跑：这台机器驱动会 TDR（一晚两次，见 [docs/baseline.md](docs/baseline.md) §3）。
+脚本按 `train_args.json` 判断"这组到底跑完没有"，崩了搬残档、探一次 `nvidia-smi`、原地重跑：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_train_guarded.ps1 `
@@ -181,9 +200,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_train_guarded.ps1 
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_overnight.ps1   # 整晚串联
 ```
 
-不装 GPU 环境也能跑通 2、3b 和 5：转换、合成与汇总只依赖 numpy / opencv / pyyaml（第 4 步的训练队列要 GPU）。
-CI 就是这么验的（ubuntu + windows × py3.10/3.12），并且在 CI 里端到端跑了一遍
-缺陷合成，逐字节断言 val/test 没被改动。
+不装 GPU 环境也能跑通 2、3b、5：转换、合成、汇总只依赖 numpy / opencv / pyyaml。CI 就是这么验的
+（ubuntu + windows × py3.10/3.12），且在 CI 里端到端跑了一遍缺陷合成、逐字节断言 val/test 未改动。
 
 ## 三个关键设计决策
 
